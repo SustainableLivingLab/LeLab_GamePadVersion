@@ -1,0 +1,262 @@
+<h1 align="center">🎮 LeLab GamePad Version</h1>
+
+<p align="center">
+  <b>LeLab, modified to drive an SO-101 follower arm with a game controller, no leader arm required.</b>
+</p>
+
+<p align="center">
+  Powered by <b>Sustainable Living Lab India</b>
+</p>
+
+This repository contains one project: **`leLab-main/`**. It's a fork of
+[LeLab](https://github.com/huggingface/lerobot/tree/main/lelab) (the official web GUI for
+[LeRobot](https://github.com/huggingface/lerobot)) with an added **gamepad input mode**: a PS5
+DualSense, Xbox-style pad, or similar controller can drive the SO-101 follower arm directly, for
+teleoperation *and* dataset recording, as a full alternative to a leader arm. You pick the
+input mode per-robot in the GUI with a toggle switch.
+
+Everything below is written for someone setting this up **for the first time, on a computer that
+has never run it before.** Follow it top to bottom in order.
+
+---
+
+## What you need before starting
+
+- **A Windows, macOS, or Linux computer.** (This guide's exact commands are for Windows +
+  PowerShell; macOS/Linux users run the same steps in a regular terminal, swapping backslashes for
+  forward slashes where it matters.)
+- **An SO-101 follower arm**, assembled and connected to the computer via USB.
+- **A game controller.** Tested with a PS5 DualSense and a wired Xbox-style pad (e.g. Logitech G
+  F310). Works wired (USB), via a wireless USB dongle, or paired over Bluetooth; any of the
+  three is fine, as long as Windows/macOS/Linux shows it as a connected controller *before* you
+  open LeLab. (Settings → Bluetooth & devices → Add device, or Settings → Devices → Game
+  controllers, to check.)
+- **Git.** Download: <https://git-scm.com/downloads>. During install, accept the defaults.
+- **Python 3.12 or newer.** Download: <https://www.python.org/downloads/>. **On the first
+  install screen, tick "Add python.exe to PATH"**: this is the single most common setup mistake.
+- **Node.js 18 or newer** (only needed if you plan to rebuild the frontend yourself; most people
+  can skip this, since the built frontend is already included in this repo). Download:
+  <https://nodejs.org/> (choose the LTS version).
+
+You do **not** need a leader arm. A GPU is optional: it speeds up training a policy, but
+calibration, gamepad teleoperation, and recording all run fine on CPU-only machines too. If you
+do have an NVIDIA GPU, `pip install -e .` picks a CUDA-enabled PyTorch build automatically as
+long as your NVIDIA drivers are installed; nothing extra to configure.
+
+---
+
+## Step 1: Get the code
+
+Open a terminal (PowerShell on Windows) and run:
+
+```powershell
+git clone <this-repo-url> LeLab_GamePadVersion
+cd LeLab_GamePadVersion\leLab-main
+```
+
+Replace `<this-repo-url>` with this repository's actual clone URL (the green "Code" button on
+its GitHub page, then copy the HTTPS URL).
+
+Everything from here on happens **inside `leLab-main`**. If a command fails with something like
+"file not found" or "no such file or directory," first check you're in the right folder:
+
+```powershell
+# Windows
+Get-Location   # should end in ...\LeLab_GamePadVersion\leLab-main
+
+# macOS/Linux
+pwd            # should end in .../LeLab_GamePadVersion/leLab-main
+```
+
+## Step 2: Install LeLab (Python side)
+
+Still inside `leLab-main`, run:
+
+```powershell
+pip install -e .
+```
+
+This single command installs everything: FastAPI, LeRobot itself (pulled from LeRobot's GitHub,
+pinned to a known-good version), the Feetech servo driver for the SO-101, and `pygame` for
+reading the gamepad. **It downloads and builds a fair amount: expect this to take 5-15 minutes**
+depending on your internet connection. That's normal; let it finish.
+
+If it finishes with no red `ERROR` lines, you're done with this step. A few yellow `WARNING`
+lines (deprecation notices, script-not-on-PATH notices) are harmless and expected.
+
+### If `pip install -e .` fails
+
+- **`'pip' is not recognized`**: Python wasn't added to PATH during install. Reinstall Python
+  and tick "Add python.exe to PATH", or run `python -m pip install -e .` instead of bare `pip`.
+- **A `torch`/CUDA-related error**: usually means pip picked a CUDA build that doesn't match your
+  GPU driver (or you don't have an NVIDIA GPU at all). Either update your GPU driver and retry, or
+  fall back to a CPU-only build; gamepad teleoperation and recording work fine without a GPU, you'd
+  only lose GPU-accelerated training:
+  ```powershell
+  pip install torch --index-url https://download.pytorch.org/whl/cpu
+  pip install -e .
+  ```
+  If you *do* have an NVIDIA GPU and want to use it, install a matching CUDA build instead, e.g.:
+  ```powershell
+  pip install torch --index-url https://download.pytorch.org/whl/cu128
+  pip install -e .
+  ```
+  (pick the `cuXXX` matching your installed CUDA version; see
+  <https://pytorch.org/get-started/locally/> if unsure).
+- **Anything mentioning `av`, `datasets`, or `torchcodec`**: run the install again; these
+  sometimes need a second pass to resolve on a fresh machine:
+  ```powershell
+  pip install -e .
+  ```
+- **On Windows, if `opencv-python-headless` and `opencv-python` conflict** (camera preview
+  windows come up black or throw an import error), run:
+  ```powershell
+  pip uninstall opencv-python-headless -y
+  pip install opencv-python
+  ```
+
+## Step 3: Confirm the install
+
+```powershell
+lelab --help
+```
+
+You should see a short usage message (`--dev`, `--rebuild`, `--no-open`, `--stop`). If instead
+you get `'lelab' is not recognized`, the install succeeded but the `lelab` command isn't on your
+PATH: either close and reopen your terminal (this fixes it 90% of the time on Windows), or run
+it as `python -m lelab.scripts.lelab --help` instead everywhere in this guide.
+
+## Step 4: Run it
+
+For everyday use (this is what you want almost every time):
+
+```powershell
+lelab
+```
+
+This starts the server, and **your browser should open automatically** to the app at
+`http://localhost:8000`. If it doesn't open automatically, open that URL yourself.
+
+To stop it: go back to the terminal window and press `Ctrl+C`. If it ever gets stuck or you want
+to force-stop a previous run:
+
+```powershell
+lelab --stop
+```
+
+### Developer / hot-reload mode
+
+If you're going to edit the code and want changes to show up live without restarting:
+
+```powershell
+lelab --dev
+```
+
+This runs two servers together: a Vite frontend on `:8080` (hot-reloads on file save) and the
+Python backend on `:8000` (auto-restarts on file save). Open `http://localhost:8080`.
+
+## Step 5: First-time setup inside the app
+
+1. **Plug in the follower arm** via USB, if you haven't already.
+2. On the landing page, click the robot name dropdown → type a name → **Create**.
+3. A new robot tile appears. It has a small toggle switch (Cable ↔ Gamepad icon): **click it to
+   switch to Gamepad mode.** In gamepad mode you only need to configure the follower arm; there's
+   no leader arm step.
+4. Click the **gear icon (Configure)** on the tile. Pick the follower's serial port (use the
+   auto-detect button if you're not sure which one it is), then run through calibration.
+   It's a short guided flow, just follow the on-screen instructions.
+5. Back on the landing page, plug in your gamepad if you haven't yet. Click the **small
+   controller icon (Test gamepad)** next to the dropdown (visible before you've even picked a
+   robot, and again on the tile in gamepad mode). It opens a live view of your controller's
+   sticks and buttons. Wiggle the sticks and press some buttons; you should see the bars and
+   button grid react in real time. If nothing reacts, see **Troubleshooting → Gamepad not
+   detected** below.
+6. Once the tile shows **"Ready"** (green), click **Teleoperation**. Press **Cross (✕ / A)** on
+   the controller to start driving the arm. Full control mapping:
+
+   | Control | Action |
+   |---|---|
+   | Left stick | Shoulder pan / shoulder lift |
+   | Right stick | Elbow flex / wrist roll |
+   | D-pad up/down | Wrist flex |
+   | Left trigger (L2/LT) | Open gripper |
+   | Right trigger (R2/RT) | Close gripper |
+   | Cross / A | Toggle drive on/off (arm holds position when off) |
+   | Triangle / Y | Smoothly return to the starting position |
+   | Circle / B | Stop the session |
+
+7. To record a dataset instead of just driving the arm live, go back to the landing page and use
+   the **Record** flow the same way. Gamepad mode works there too, using the same controls above
+   plus the on-screen recording buttons (start episode, re-record, stop).
+
+That's the whole loop: create a robot → gamepad mode → configure the follower → calibrate → test
+the controller → teleoperate or record.
+
+---
+
+## Troubleshooting
+
+### Gamepad not detected
+
+- Make sure the controller is connected **at the operating-system level first**: Python only
+  sees what the OS already sees. Check:
+  - **Windows:** Settings → Bluetooth & devices → Devices (Bluetooth) or Settings → Devices and
+    Printers (USB/wired). The controller should be listed there.
+  - Try unplugging and replugging (USB) or re-pairing (Bluetooth), then reopen the "Test gamepad"
+    view. No need to restart LeLab.
+- Only **one** application can hold the controller at a time in this app. If you have the "Test
+  gamepad" view open in one browser tab and try to start teleoperation in another, close the test
+  view first.
+- Some Bluetooth stacks briefly show the controller as connected before it's actually ready to
+  send data. Wait a few seconds after pairing before opening the test view.
+
+### "Could not connect to the follower arm on COM_"
+
+- Check the arm is powered on and the USB cable is fully seated.
+- Use the auto-detect port button on the Configure page rather than typing a port name: the
+  actual COM/serial port number is specific to your machine and can change between reboots.
+- On Windows, check Device Manager → Ports (COM & LPT) to confirm which port the arm's USB-serial
+  chip is on.
+
+### `lelab` opens but the page is blank / errors in the browser console
+
+- Hard-refresh the page (`Ctrl+Shift+R`).
+- If you were previously running `lelab --dev` and switched to plain `lelab` (or vice versa), run
+  `lelab --stop` first, then start again cleanly.
+
+### Port 8000 or 8080 already in use
+
+```powershell
+lelab --stop
+```
+
+then start again. This frees both ports if a previous run didn't shut down cleanly.
+
+### Still stuck
+
+Check the terminal window LeLab is running in: errors are logged there with a full description,
+which is almost always more specific than anything in the browser. If you're not sure what a
+particular error means, copy the full error text (not just the last line) before asking for help.
+
+---
+
+## What's different from upstream LeLab
+
+- **Gamepad teleoperation and recording**: a new input mode alongside the existing leader-arm
+  mode, selectable per-robot via a toggle switch on the robot tile. The leader-arm path is
+  completely untouched; this is purely additive.
+- **Live gamepad test view**: a "Test gamepad" button shows real-time stick/button/D-pad values
+  in the browser, so you can confirm your controller is detected and mapped correctly before
+  trusting it with the robot.
+- Everything else (calibration, camera setup, training, replay, Hub upload) works exactly as in
+  upstream LeLab.
+
+For the full technical rundown of how the app is put together, see
+[`leLab-main/CLAUDE.md`](leLab-main/CLAUDE.md).
+
+## Credits
+
+Built on [LeLab](https://github.com/huggingface/lerobot/tree/main/lelab) and
+[LeRobot](https://github.com/huggingface/lerobot) by Hugging Face. Gamepad teleoperation mapping
+adapted from an SO-101 gamepad teleop/recording pipeline. Modified and maintained by
+**Sustainable Living Lab India**.

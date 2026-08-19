@@ -1,0 +1,5 @@
+# Only leLab-main is tracked in this repo. Everything else at this level is
+# reference/vendored material used during development and is not published.
+.claude/
+lerobot-main/
+Robotic-arm-main/
