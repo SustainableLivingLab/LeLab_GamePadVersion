@@ -21,28 +21,37 @@ import time
 from pathlib import Path
 from typing import Literal
 
+from lerobot.utils.constants import HF_LEROBOT_HOME
+
 logger = logging.getLogger(__name__)
 
 RobotSide = Literal["leader", "follower"]
 
+# Every path below is derived from HF_LEROBOT_HOME (which itself resolves the
+# HF_LEROBOT_HOME / HF_HOME env vars, falling back to ~/.cache/huggingface) so
+# lelab agrees with lerobot core on where calibration/dataset files actually
+# live. A hardcoded ~/.cache/huggingface path here would silently diverge from
+# lerobot's own save location on any machine with HF_HOME set elsewhere,
+# leaving lelab unable to find calibration it just watched lerobot save.
+
 # Define the calibration config paths (shared between features)
-CALIBRATION_BASE_PATH_TELEOP = os.path.expanduser("~/.cache/huggingface/lerobot/calibration/teleoperators")
-CALIBRATION_BASE_PATH_ROBOTS = os.path.expanduser("~/.cache/huggingface/lerobot/calibration/robots")
+CALIBRATION_BASE_PATH_TELEOP = str(HF_LEROBOT_HOME / "calibration" / "teleoperators")
+CALIBRATION_BASE_PATH_ROBOTS = str(HF_LEROBOT_HOME / "calibration" / "robots")
 LEADER_CONFIG_PATH = os.path.join(CALIBRATION_BASE_PATH_TELEOP, "so_leader")
 FOLLOWER_CONFIG_PATH = os.path.join(CALIBRATION_BASE_PATH_ROBOTS, "so_follower")
 
 # Define port storage path
-PORT_CONFIG_PATH = os.path.expanduser("~/.cache/huggingface/lerobot/ports")
+PORT_CONFIG_PATH = str(HF_LEROBOT_HOME / "ports")
 LEADER_PORT_FILE = os.path.join(PORT_CONFIG_PATH, "leader_port.txt")
 FOLLOWER_PORT_FILE = os.path.join(PORT_CONFIG_PATH, "follower_port.txt")
 
 # Define configuration storage path
-CONFIG_STORAGE_PATH = os.path.expanduser("~/.cache/huggingface/lerobot/saved_configs")
+CONFIG_STORAGE_PATH = str(HF_LEROBOT_HOME / "saved_configs")
 LEADER_CONFIG_FILE = os.path.join(CONFIG_STORAGE_PATH, "leader_config.txt")
 FOLLOWER_CONFIG_FILE = os.path.join(CONFIG_STORAGE_PATH, "follower_config.txt")
 
 # Robot config records (per-robot JSON metadata)
-ROBOTS_PATH = os.path.expanduser("~/.cache/huggingface/lerobot/robots")
+ROBOTS_PATH = str(HF_LEROBOT_HOME / "robots")
 
 # Tag stamped on every dataset pushed to the Hub from LeLab, so we can later
 # query the Hub for LeLab-produced datasets and compute usage metrics.

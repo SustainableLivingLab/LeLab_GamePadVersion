@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import logging
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from huggingface_hub.errors import HfHubHTTPError
+from lerobot.utils.constants import HF_LEROBOT_HOME
 
 from .utils.hf_auth import cached_whoami, shared_hf_api
 
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def _lerobot_cache_root() -> Path:
-    return Path(os.environ.get("HF_LEROBOT_HOME", "~/.cache/huggingface/lerobot")).expanduser()
+    return HF_LEROBOT_HOME
 
 
 def _is_dataset_dir(path: Path) -> bool:
