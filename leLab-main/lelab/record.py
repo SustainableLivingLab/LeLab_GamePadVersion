@@ -424,16 +424,18 @@ def handle_recording_status() -> dict[str, Any]:
     # If recording is not active and phase is completed or error, indicate session has ended
     session_ended = not recording_active and current_phase in ["completed", "error"]
 
-    # Log when session has ended to help debug frontend polling
+    # Log when session has ended to help debug frontend polling.
+    # logger.info() only (no print()) here: a raw print() of this line's emoji
+    # crashes with UnicodeEncodeError on a Windows console using the legacy
+    # cp1252 codepage (colorama's console wrapper doesn't re-encode to UTF-8),
+    # which took the whole request down with a 500 instead of just logging.
     if session_ended:
         if current_phase == "error":
             logger.info(
                 "📡 RECORDING STATUS REQUEST: Session failed with error - frontend should stop polling"
             )
-            print("📡 STATUS CHANGE: Frontend is still polling after session error - should stop now")
         else:
             logger.info("📡 RECORDING STATUS REQUEST: Session has ended - frontend should stop polling")
-            print("📡 STATUS CHANGE: Frontend is still polling after session end - should stop now")
 
     status = {
         "recording_active": recording_active,
@@ -813,8 +815,8 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
             phase_start_time = time.time()
             logger.info(f"Starting recording phase for episode {current_episode}")
             logger.info(f"Events state at start of recording phase: {web_events}")
-            print(
-                f"🎬 STATUS CHANGE: Starting recording phase for episode {current_episode}/{cfg.dataset.num_episodes}"
+            logger.info(
+                f"🎬 Starting recording phase for episode {current_episode}/{cfg.dataset.num_episodes}"
             )
 
             log_say(f"Recording episode {current_episode}", cfg.play_sounds)
@@ -843,24 +845,18 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
             recording_interrupted_by_exit_early = web_events.get("_exit_early_triggered", False)
             if recording_interrupted_by_exit_early:
                 logger.info("🟡 RECORDING PHASE INTERRUPTED BY EXIT_EARLY - proceeding to save episode")
-                print(
-                    f"🟡 STATUS CHANGE: Recording phase interrupted by user - episode {current_episode} data collected"
-                )
                 # Reset our tracking flag
                 web_events["_exit_early_triggered"] = False
             else:
                 # Recording completed due to timeout - trigger re-record behavior
                 logger.info("⏰ RECORDING PHASE COMPLETED DUE TO TIMEOUT - triggering re-record")
-                print(
-                    f"⏰ STATUS CHANGE: Recording timeout reached for episode {current_episode} - re-recording"
-                )
                 web_events["rerecord_episode"] = True
 
             # Handle rerecord logic first (before saving)
             if web_events["rerecord_episode"]:
                 log_say("Re-record episode", cfg.play_sounds)
-                print(
-                    f"🔄 STATUS CHANGE: Re-recording episode {current_episode} (episode number stays the same)"
+                logger.info(
+                    f"Re-recording episode {current_episode} (episode number stays the same)"
                 )
                 web_events["rerecord_episode"] = False
                 web_events["exit_early"] = False
@@ -872,7 +868,6 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
                 phase_start_time = time.time()
                 logger.info(f"Starting reset phase for re-record of episode {current_episode}")
                 logger.info(f"Events state at start of reset phase: {web_events}")
-                print(f"🔄 STATUS CHANGE: Starting reset phase for episode {current_episode}")
 
                 log_say("Reset the environment", cfg.play_sounds)
 
@@ -900,15 +895,11 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
                 # Check if reset was interrupted by exit_early
                 if web_events["exit_early"]:
                     logger.info("🟡 RESET PHASE INTERRUPTED BY EXIT_EARLY during re-record")
-                    print("🟡 STATUS CHANGE: Reset phase interrupted by user during re-record")
                     web_events["exit_early"] = False
 
                 # Check if stop recording was requested during re-record reset phase
                 if web_events["stop_recording"]:
                     logger.info("🛑 STOP RECORDING requested during re-record reset phase - ending session")
-                    print(
-                        "🛑 STATUS CHANGE: Stop recording requested during re-record reset - ending session"
-                    )
                     break
 
                 # Don't increment current_episode or saved_episodes - we're re-recording the same episode
@@ -916,10 +907,8 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
 
             # Save episode immediately after recording phase (matches expected flow)
             logger.info(f"💾 Saving episode {current_episode}...")
-            print(f"💾 STATUS CHANGE: Saving episode {current_episode}")
             dataset.save_episode()
             logger.info(f"✅ Episode {current_episode} saved successfully")
-            print(f"✅ STATUS CHANGE: Episode {current_episode} saved successfully")
 
             # Increment episode counters after successful save
             saved_episodes += 1
@@ -927,7 +916,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
 
             # Check if we should stop recording
             if web_events["stop_recording"]:
-                print("🛑 STATUS CHANGE: Recording manually stopped by user")
+                logger.info("🛑 Recording manually stopped by user")
                 break
 
             # Check if we've completed all episodes
@@ -942,7 +931,6 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
                 phase_start_time = time.time()
                 logger.info(f"Starting reset phase for next episode {current_episode}")
                 logger.info(f"Events state at start of reset phase: {web_events}")
-                print(f"🔄 STATUS CHANGE: Starting reset phase for episode {current_episode}")
 
                 log_say("Reset the environment", cfg.play_sounds)
 
@@ -970,19 +958,17 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
                 # Check if reset was interrupted by exit_early
                 if web_events["exit_early"]:
                     logger.info("🟡 RESET PHASE INTERRUPTED BY EXIT_EARLY - proceeding to next episode")
-                    print("🟡 STATUS CHANGE: Reset phase interrupted by user - proceeding to next episode")
                     web_events["exit_early"] = False
 
                 # Check if stop recording was requested during reset phase
                 if web_events["stop_recording"]:
                     logger.info("🛑 STOP RECORDING requested during reset phase - ending session")
-                    print("🛑 STATUS CHANGE: Stop recording requested during reset - ending session")
                     break
 
         # Recording completed
         current_phase = "completed"
         phase_start_time = None
-        print("🏁 STATUS CHANGE: Recording session completed - all episodes finished")
+        logger.info("🏁 Recording session completed - all episodes finished")
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
     finally:
