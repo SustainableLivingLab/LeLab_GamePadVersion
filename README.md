@@ -186,26 +186,31 @@ the controller → teleoperate or record.
 ## Default Gamepad Controls
 
 These are the out-of-the-box control mappings, confirmed on a PS5 DualSense and a wired
-Logitech G F310 (both report the same axis order and face-button layout). Applies to both
-teleoperation and recording.
+Logitech G F310 (both report the same axis order and face-button layout on this app's supported
+platforms). Arm-driving controls (sticks, D-pad, triggers, Cross, Triangle) work identically in
+**both teleoperation and recording**: you fly the arm with the gamepad in either mode. Circle
+only applies to teleoperation; during recording, episode start/next/re-record/stop are always the
+on-screen buttons, never a gamepad button.
 
-| Control | Action |
-|---|---|
-| Left stick (X) | Shoulder pan |
-| Left stick (Y) | Shoulder lift |
-| Right stick (Y) | Elbow flex |
-| Right stick (X) | Wrist roll |
-| D-pad up / down | Wrist flex |
-| Left trigger (L2 / LT) | Open gripper |
-| Right trigger (R2 / RT) | Close gripper |
-| Cross / A (button 0) | Toggle arm motion on/off (arm holds its current position while off) |
-| Triangle / Y (button 3) | Smoothly return to the position the arm was in when teleoperation started |
-| Circle / B (button 1) | Stop the session |
+| Control | Raw index | Action |
+|---|---|---|
+| Left stick, left/right | Axis 0 | Shoulder pan |
+| Left stick, up/down | Axis 1 | Shoulder lift |
+| Right stick, up/down | Axis 3 | Elbow flex |
+| Right stick, left/right | Axis 2 | Wrist roll |
+| D-pad up | Hat, or button 11 | Wrist flex up |
+| D-pad down | Hat, or button 12 | Wrist flex down |
+| Left trigger (L2 / LT) | Axis 4 | Open gripper |
+| Right trigger (R2 / RT) | Axis 5 | Close gripper |
+| Cross / A | Button 0 | Toggle arm motion on/off (arm holds its current position while off) |
+| Triangle / Y | Button 3 | Smoothly return to the position the arm was in when the session started |
+| Circle / B | Button 1 | Stop the session (**teleoperation only**) |
 
 **Arm motion is off by default when a session starts**: press Cross/A once before touching the
 sticks, or nothing will move. Stick deflection controls *speed*, not position: how far you push a
 stick sets how fast that joint moves, not where it goes, since a stick naturally re-centers to
-zero when released.
+zero when released. The D-pad is auto-detected as either a hat (most Xbox-layout pads) or two
+separate buttons (the DualSense); you don't need to configure which.
 
 If your controller reports axes/buttons in a different order (some third-party pads do), or a
 control moves the wrong direction, these constants live in
@@ -213,7 +218,8 @@ control moves the wrong direction, these constants live in
 match your hardware. The **Test gamepad** view (see Step 5 above) shows you exactly which axis
 or button index changes as you move each stick, which is the fastest way to work out the right
 numbers for an unfamiliar controller. `JOINT_CONFIG` holds each joint's axis index and sign;
-`BUTTON_START_PAUSE` / `BUTTON_HOME` / `BUTTON_QUIT` hold the three face-button indices.
+`BUTTON_DPAD_UP` / `BUTTON_DPAD_DOWN` hold the D-pad's button fallback indices; `BUTTON_START_PAUSE`
+/ `BUTTON_HOME` / `BUTTON_QUIT` hold the three face-button indices.
 
 ---
 
