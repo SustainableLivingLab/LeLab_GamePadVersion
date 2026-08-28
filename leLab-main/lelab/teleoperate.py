@@ -141,10 +141,13 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
             f"leader port: {request.leader_port}, follower port: {request.follower_port}"
         )
 
-        # Setup calibration files. Gamepad mode has no leader arm, so its config
-        # name is never used, but setup_calibration_files still needs a follower.
+        # Setup calibration files. Gamepad mode has no leader arm -- ignore
+        # request.leader_config even if it's non-empty (e.g. a robot that was
+        # leader-configured before being switched to gamepad mode still has a
+        # stale leader_config on its record), so a leader calibration file
+        # that was never created for this robot can't block startup.
         leader_config_name, follower_config_name = setup_calibration_files(
-            request.leader_config, request.follower_config
+            "" if gamepad_mode else request.leader_config, request.follower_config
         )
 
         # Create robot config
