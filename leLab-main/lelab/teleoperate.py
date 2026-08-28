@@ -110,13 +110,27 @@ def _safe_disconnect(device) -> None:
     safe_disconnect_device(device, logger)
 
 
+_GAMEPAD_CONNECT_TIMEOUT_S = 10.0
+
+
 def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=None) -> dict[str, Any]:
     """Handle start teleoperation request.
 
     Connects to both arms *synchronously* so that a connection failure (arm
     unplugged, port busy, power off) is reported back to the caller, rather than
     dying silently in the worker thread while the API has already claimed
-    success. Only the teleoperation loop runs in the background thread.
+    success.
+
+    In gamepad mode, the gamepad's connect() and every later get_action() call
+    must run on the *same* thread: pygame's SDL joystick backend is thread-
+    affine on Windows, and reading a Joystick from a different thread than the
+    one that opened it silently returns a frozen snapshot instead of live
+    input (this is exactly the bug that made the arm never move even though a
+    session started successfully). So for gamepad mode, connect() happens
+    inside the worker thread itself -- the request thread blocks on a
+    threading.Event until that connect step reports success or failure,
+    keeping the synchronous-error-reporting contract without ever touching
+    pygame from two different threads.
     """
     global teleoperation_active, teleoperation_thread, current_robot, current_teleop
 
@@ -173,13 +187,7 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                 "Make sure it's plugged in and powered on, then try again."
             ) from e
 
-        if gamepad_mode:
-            logger.info("Connecting to gamepad...")
-            try:
-                teleop_device.connect()
-            except Exception as e:
-                raise RuntimeError(f"Could not connect to a gamepad: {e}") from e
-        else:
+        if not gamepad_mode:
             logger.info("Connecting to leader arm...")
             try:
                 teleop_device.bus.connect()
@@ -189,31 +197,61 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                     "Make sure it's plugged in and powered on, then try again."
                 ) from e
 
-        # Write calibration to motors' memory
-        logger.info("Writing calibration to motors...")
-        robot.bus.write_calibration(robot.calibration)
-        if not gamepad_mode:
+            # Write calibration to motors' memory
+            logger.info("Writing calibration to motors...")
+            robot.bus.write_calibration(robot.calibration)
             teleop_device.bus.write_calibration(teleop_device.calibration)
 
-        # Connect cameras and configure motors
-        logger.info("Connecting cameras and configuring motors...")
-        for cam in robot.cameras.values():
-            cam.connect()
-        robot.configure()
-        teleop_device.configure()
-        if gamepad_mode:
-            # The gamepad has no position of its own; seed its target from
-            # wherever the follower currently is so the first tick doesn't jump it.
-            teleop_device.seed(robot)
-        logger.info("Successfully connected to both devices")
+            # Connect cameras and configure motors
+            logger.info("Connecting cameras and configuring motors...")
+            for cam in robot.cameras.values():
+                cam.connect()
+            robot.configure()
+            teleop_device.configure()
+            logger.info("Successfully connected to both devices")
+        else:
+            # Robot-side calibration/camera/configure still happens here on
+            # the request thread -- none of it touches pygame.
+            logger.info("Writing calibration to motors...")
+            robot.bus.write_calibration(robot.calibration)
+            logger.info("Connecting cameras and configuring motors...")
+            for cam in robot.cameras.values():
+                cam.connect()
+            robot.configure()
 
         current_robot = robot
         current_teleop = teleop_device
+
+        # Gamepad connect (and seed) happens inside the worker thread; the
+        # request thread waits on this event for that step's outcome before
+        # responding, so a bad/missing controller is still reported
+        # synchronously to the caller.
+        gamepad_ready = threading.Event()
+        gamepad_connect_error: list[str] = []
 
         # Stream the arms in the background; the worker owns disconnect so stop()
         # does not race the serial bus from the request thread.
         def teleoperation_worker():
             global teleoperation_active, current_robot, current_teleop
+
+            if gamepad_mode:
+                try:
+                    logger.info("Connecting to gamepad...")
+                    teleop_device.connect()
+                    teleop_device.configure()
+                    # The gamepad has no position of its own; seed its target
+                    # from wherever the follower currently is so the first
+                    # tick doesn't jump it.
+                    teleop_device.seed(robot)
+                    logger.info("Gamepad connected.")
+                except Exception as e:
+                    gamepad_connect_error.append(f"Could not connect to a gamepad: {e}")
+                    gamepad_ready.set()
+                    _safe_disconnect(robot)
+                    _safe_disconnect(teleop_device)
+                    global_state_reset()
+                    return
+                gamepad_ready.set()
 
             logger.info("Starting teleoperation loop...")
             try:
@@ -266,14 +304,27 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                 _safe_disconnect(robot)
                 _safe_disconnect(teleop_device)
                 logger.info("Teleoperation stopped")
-                teleoperation_active = False
-                current_robot = None
-                current_teleop = None
+                global_state_reset()
+
+        def global_state_reset():
+            global teleoperation_active, current_robot, current_teleop
+            teleoperation_active = False
+            current_robot = None
+            current_teleop = None
 
         teleoperation_thread = threading.Thread(
             target=teleoperation_worker, name="teleoperation-worker", daemon=True
         )
         teleoperation_thread.start()
+
+        if gamepad_mode:
+            if not gamepad_ready.wait(timeout=_GAMEPAD_CONNECT_TIMEOUT_S):
+                # Worker never reported back -- treat as a failure rather than
+                # hang the request indefinitely.
+                teleoperation_active = False
+                return {"success": False, "message": "Timed out connecting to the gamepad."}
+            if gamepad_connect_error:
+                return {"success": False, "message": gamepad_connect_error[0]}
 
         return {
             "success": True,
