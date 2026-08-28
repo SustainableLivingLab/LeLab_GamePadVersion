@@ -203,8 +203,20 @@ class GamepadSO101Teleop(Teleoperator):
         self._pygame = pygame
         pygame.init()
         pygame.joystick.init()
+        pygame.event.pump()
         if pygame.joystick.get_count() == 0:
-            raise RuntimeError("No gamepad detected. Connect a controller and try again.")
+            # A Bluetooth controller paired *after* pygame's joystick subsystem
+            # last initialized won't show up in get_count() until SDL
+            # re-enumerates devices -- quit()+init() forces that rescan rather
+            # than trusting a snapshot that may predate the pairing.
+            pygame.joystick.quit()
+            pygame.joystick.init()
+            pygame.event.pump()
+        if pygame.joystick.get_count() == 0:
+            raise RuntimeError(
+                "No gamepad detected. Connect a controller and try again. If you just paired "
+                "it over Bluetooth, wait a few seconds after pairing completes, then retry."
+            )
         self._joystick = pygame.joystick.Joystick(self.config.joystick_index)
         self._joystick.init()
         logger.info(f"Gamepad connected: {self._joystick.get_name()}")

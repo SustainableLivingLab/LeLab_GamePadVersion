@@ -22,6 +22,15 @@ short-lived pygame joystick handle on demand. Refuses to run concurrently with
 an active gamepad teleop session (both would fight over the same pygame
 joystick subsystem); callers should point the user at the live session's own
 status instead in that case.
+
+All pygame/SDL calls happen on a single dedicated background thread. SDL's
+joystick backend on Windows is thread-affine -- reading a Joystick from a
+different thread than the one that opened it can silently return a frozen
+snapshot instead of live values. FastAPI serves each request on a threadpool
+thread (a different one per request), so touching pygame directly from the
+request handler was exactly this bug: the debug view showed a static first
+reading that never updated. The poller thread below owns pygame end-to-end;
+HTTP handlers only ever read a lock-protected cache of its last reading.
 """
 
 from __future__ import annotations
@@ -36,93 +45,125 @@ logger = logging.getLogger(__name__)
 # Idle handles are released after this long so a forgotten-open debug panel
 # doesn't hold the joystick open (and out of reach of a teleop session) forever.
 _IDLE_TIMEOUT_S = 30.0
+# How often the poller thread re-reads the joystick.
+_POLL_INTERVAL_S = 0.05  # 20 Hz -- comfortably faster than the frontend's 10 Hz poll
 
 
 class GamepadProbe:
-    """Owns a single on-demand pygame joystick handle for the debug endpoint."""
+    """Owns a single on-demand pygame joystick handle for the debug endpoint.
+
+    All actual pygame calls happen inside `_poll_loop`, which runs on one
+    dedicated thread for the handle's whole lifetime. `read()` (called from
+    FastAPI's threadpool) never touches pygame itself -- it only reads
+    `self._latest` under `self._lock`, which `_poll_loop` keeps fresh.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._pygame = None
-        self._joystick = None
-        self._last_poll = 0.0
+        self._poll_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._latest: dict[str, Any] = {"connected": False, "message": "No gamepad detected."}
+        self._last_read_request = 0.0
 
-    def _ensure_open(self) -> None:
-        if self._joystick is not None:
-            return
+    def _start_poll_thread_locked(self) -> None:
+        """Caller must hold self._lock."""
+        self._stop_event.clear()
+        self._poll_thread = threading.Thread(target=self._poll_loop, name="gamepad-debug-poll", daemon=True)
+        self._poll_thread.start()
+
+    def _poll_loop(self) -> None:
         import pygame
 
-        self._pygame = pygame
-        pygame.init()
-        pygame.joystick.init()
-        if pygame.joystick.get_count() == 0:
-            raise RuntimeError("No gamepad detected.")
-        self._joystick = pygame.joystick.Joystick(0)
-        self._joystick.init()
-        logger.info(f"Gamepad debug probe connected: {self._joystick.get_name()}")
+        try:
+            pygame.init()
+            pygame.joystick.init()
+            pygame.event.pump()
+            if pygame.joystick.get_count() == 0:
+                # A Bluetooth controller paired *after* pygame's joystick
+                # subsystem last initialized won't show up in get_count() until
+                # SDL re-enumerates devices -- quit()+init() forces that rescan
+                # rather than trusting a snapshot that may predate the pairing.
+                pygame.joystick.quit()
+                pygame.joystick.init()
+                pygame.event.pump()
+            if pygame.joystick.get_count() == 0:
+                with self._lock:
+                    self._latest = {
+                        "connected": False,
+                        "message": (
+                            "No gamepad detected. If you just paired it over Bluetooth, wait a "
+                            "few seconds after pairing completes, then try again."
+                        ),
+                    }
+                return
+
+            joystick = pygame.joystick.Joystick(0)
+            joystick.init()
+            name = joystick.get_name()
+            logger.info(f"Gamepad debug probe connected: {name}")
+
+            while not self._stop_event.is_set():
+                try:
+                    pygame.event.pump()
+                    axes = [round(joystick.get_axis(i), 3) for i in range(joystick.get_numaxes())]
+                    buttons = [bool(joystick.get_button(i)) for i in range(joystick.get_numbuttons())]
+                    hats = [list(joystick.get_hat(i)) for i in range(joystick.get_numhats())]
+                except Exception as e:
+                    # Controller likely unplugged mid-read.
+                    logger.warning(f"Gamepad debug probe read failed, stopping poll: {e}")
+                    with self._lock:
+                        self._latest = {"connected": False, "message": str(e)}
+                    return
+
+                with self._lock:
+                    self._latest = {
+                        "connected": True,
+                        "name": name,
+                        "num_axes": len(axes),
+                        "num_buttons": len(buttons),
+                        "num_hats": len(hats),
+                        "axes": axes,
+                        "buttons": buttons,
+                        "hats": hats,
+                    }
+
+                # Auto-release if nobody's actually polling the HTTP endpoint
+                # anymore (e.g. the browser tab was closed without the modal's
+                # cleanup running), so the joystick handle doesn't stay open
+                # forever and block a real teleop session from claiming it.
+                if time.time() - self._last_read_request > _IDLE_TIMEOUT_S:
+                    logger.info("Gamepad debug probe idle -- releasing handle.")
+                    return
+
+                self._stop_event.wait(_POLL_INTERVAL_S)
+        finally:
+            try:
+                pygame.joystick.quit()
+            except Exception:
+                pass
+            try:
+                pygame.quit()
+            except Exception:
+                pass
+
+    def read(self) -> dict[str, Any]:
+        """Return the most recent reading, starting the poll thread if needed."""
+        with self._lock:
+            self._last_read_request = time.time()
+            thread_alive = self._poll_thread is not None and self._poll_thread.is_alive()
+            if not thread_alive:
+                self._latest = {"connected": False, "message": "No gamepad detected."}
+                self._start_poll_thread_locked()
+            return dict(self._latest)
 
     def close(self) -> None:
         with self._lock:
-            self._close_locked()
-
-    def _close_locked(self) -> None:
-        if self._joystick is not None:
-            try:
-                self._joystick.quit()
-            except Exception:
-                pass
-            self._joystick = None
-        if self._pygame is not None:
-            try:
-                self._pygame.joystick.quit()
-            except Exception:
-                pass
-            self._pygame = None
-
-    def read(self) -> dict[str, Any]:
-        """Open (or reuse) a joystick handle and return its current state."""
+            self._stop_event.set()
+            thread = self._poll_thread
+        if thread is not None:
+            thread.join(timeout=2.0)
         with self._lock:
-            try:
-                self._ensure_open()
-            except Exception as e:
-                self._close_locked()
-                return {"connected": False, "message": str(e)}
-
-            pygame = self._pygame
-            js = self._joystick
-            try:
-                pygame.event.pump()
-                axes = [round(js.get_axis(i), 3) for i in range(js.get_numaxes())]
-                buttons = [bool(js.get_button(i)) for i in range(js.get_numbuttons())]
-                hats = [list(js.get_hat(i)) for i in range(js.get_numhats())]
-                name = js.get_name()
-            except Exception as e:
-                # Controller likely unplugged mid-read -- drop the stale handle so
-                # the next poll re-detects instead of erroring forever.
-                logger.warning(f"Gamepad debug probe read failed, releasing handle: {e}")
-                self._close_locked()
-                return {"connected": False, "message": str(e)}
-
-            self._last_poll = time.time()
-            return {
-                "connected": True,
-                "name": name,
-                "num_axes": len(axes),
-                "num_buttons": len(buttons),
-                "num_hats": len(hats),
-                "axes": axes,
-                "buttons": buttons,
-                "hats": hats,
-            }
-
-    def release_if_idle(self) -> None:
-        """Drop the handle if nobody has polled in a while. Call this from a
-        background sweep so a forgotten-open browser tab doesn't hold the
-        joystick forever and block a real teleop session from opening it."""
-        with self._lock:
-            if self._joystick is not None and time.time() - self._last_poll > _IDLE_TIMEOUT_S:
-                logger.info("Gamepad debug probe idle -- releasing handle.")
-                self._close_locked()
+            self._poll_thread = None
 
 
 # Global probe instance, mirroring the CalibrationManager singleton pattern.
@@ -138,6 +179,11 @@ def handle_gamepad_status() -> dict[str, Any]:
     from .gamepad_teleop import GamepadSO101Teleop
 
     if _teleoperate.teleoperation_active and isinstance(_teleoperate.current_teleop, GamepadSO101Teleop):
+        # A session is live: stop our own poll thread (if one happened to be
+        # running from before the session started) so it isn't fighting the
+        # session's teleop thread over the same joystick handle.
+        gamepad_probe.close()
+
         teleop = _teleoperate.current_teleop
         name = None
         if teleop._joystick is not None:
@@ -154,5 +200,4 @@ def handle_gamepad_status() -> dict[str, Any]:
             "running": events["running"],
         }
 
-    gamepad_probe.release_if_idle()
     return {**gamepad_probe.read(), "in_session": False}

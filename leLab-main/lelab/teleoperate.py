@@ -216,10 +216,25 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
             try:
                 last_broadcast_time = 0
                 broadcast_interval = 0.05  # 20 FPS
+                last_gamepad_debug_log = 0.0
 
                 while teleoperation_active:
                     action = teleop_device.get_action()
-                    robot.send_action(action)
+                    sent = robot.send_action(action)
+
+                    if gamepad_mode:
+                        now_dbg = time.time()
+                        if now_dbg - last_gamepad_debug_log > 1.0:
+                            last_gamepad_debug_log = now_dbg
+                            js = teleop_device._joystick
+                            axes = [round(js.get_axis(i), 3) for i in range(js.get_numaxes())] if js else None
+                            logger.info(
+                                "[gamepad-debug] running=%s axes=%s action=%s sent=%s",
+                                teleop_device._running,
+                                axes,
+                                action,
+                                sent,
+                            )
 
                     if gamepad_mode and teleop_device.get_teleop_events()["quit_requested"]:
                         logger.info("Gamepad Circle pressed -- stopping teleoperation.")

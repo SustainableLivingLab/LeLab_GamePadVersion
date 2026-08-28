@@ -172,25 +172,48 @@ Python backend on `:8000` (auto-restarts on file save). Open `http://localhost:8
    button grid react in real time. If nothing reacts, see **Troubleshooting → Gamepad not
    detected** below.
 6. Once the tile shows **"Ready"** (green), click **Teleoperation**. Press **Cross (✕ / A)** on
-   the controller to start driving the arm. Full control mapping:
-
-   | Control | Action |
-   |---|---|
-   | Left stick | Shoulder pan / shoulder lift |
-   | Right stick | Elbow flex / wrist roll |
-   | D-pad up/down | Wrist flex |
-   | Left trigger (L2/LT) | Open gripper |
-   | Right trigger (R2/RT) | Close gripper |
-   | Cross / A | Toggle drive on/off (arm holds position when off) |
-   | Triangle / Y | Smoothly return to the starting position |
-   | Circle / B | Stop the session |
-
+   the controller to start driving the arm. See **Default Gamepad Controls** below for the full
+   mapping.
 7. To record a dataset instead of just driving the arm live, go back to the landing page and use
    the **Record** flow the same way. Gamepad mode works there too, using the same controls above
    plus the on-screen recording buttons (start episode, re-record, stop).
 
 That's the whole loop: create a robot → gamepad mode → configure the follower → calibrate → test
 the controller → teleoperate or record.
+
+---
+
+## Default Gamepad Controls
+
+These are the out-of-the-box control mappings, confirmed on a PS5 DualSense and a wired
+Logitech G F310 (both report the same axis order and face-button layout). Applies to both
+teleoperation and recording.
+
+| Control | Action |
+|---|---|
+| Left stick (X) | Shoulder pan |
+| Left stick (Y) | Shoulder lift |
+| Right stick (Y) | Elbow flex |
+| Right stick (X) | Wrist roll |
+| D-pad up / down | Wrist flex |
+| Left trigger (L2 / LT) | Open gripper |
+| Right trigger (R2 / RT) | Close gripper |
+| Cross / A (button 0) | Toggle arm motion on/off (arm holds its current position while off) |
+| Triangle / Y (button 3) | Smoothly return to the position the arm was in when teleoperation started |
+| Circle / B (button 1) | Stop the session |
+
+**Arm motion is off by default when a session starts**: press Cross/A once before touching the
+sticks, or nothing will move. Stick deflection controls *speed*, not position: how far you push a
+stick sets how fast that joint moves, not where it goes, since a stick naturally re-centers to
+zero when released.
+
+If your controller reports axes/buttons in a different order (some third-party pads do), or a
+control moves the wrong direction, these constants live in
+[`leLab-main/lelab/gamepad_teleop.py`](leLab-main/lelab/gamepad_teleop.py) and can be edited to
+match your hardware. The **Test gamepad** view (see Step 5 above) shows you exactly which axis
+or button index changes as you move each stick, which is the fastest way to work out the right
+numbers for an unfamiliar controller. `JOINT_CONFIG` holds each joint's axis index and sign;
+`BUTTON_START_PAUSE` / `BUTTON_HOME` / `BUTTON_QUIT` hold the three face-button indices.
 
 ---
 
@@ -209,6 +232,15 @@ the controller → teleoperate or record.
   view first.
 - Some Bluetooth stacks briefly show the controller as connected before it's actually ready to
   send data. Wait a few seconds after pairing before opening the test view.
+- **Windows: paired over Bluetooth but "Test gamepad" still says "No gamepad detected"** even
+  after waiting and retrying: check Device Manager → **"Human Interface Devices"** vs
+  **"Game controllers"**. If the paired controller only shows up as a generic HID device and not
+  under "Game controllers", Windows itself never classified it as a joystick, and no amount of
+  retrying in the app will fix it. This is a known issue with some controllers over Bluetooth
+  (the PS5 DualSense in particular): unpair and re-pair, try toggling the controller's connection
+  mode (many controllers have a separate "PC mode" button combo distinct from console pairing
+  mode), or fall back to a **USB cable or a wireless USB dongle** for that controller, which
+  reliably registers as a proper game controller on Windows.
 
 ### "Could not connect to the follower arm on COM_"
 
