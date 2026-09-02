@@ -292,6 +292,11 @@ particular error means, copy the full error text (not just the last line) before
   was collected so far to a valid local dataset. The page you land on afterward offers a
   "Continue Recording" button to append more episodes later (with the same robot connection
   carried forward automatically), alongside the existing Hub upload flow.
+- **Gamepad drops don't end the session**: if the controller loses connection mid-teleoperation
+  or mid-recording (a Bluetooth hiccup, a dongle going out of range, a USB unplug), the arm holds
+  its last position and the app keeps retrying the connection in the background instead of
+  crashing the session. A red "reconnecting" badge shows on the Teleoperation and Recording pages
+  while it's out; control resumes automatically once it's back.
 - Everything else (calibration, camera setup, training, replay, Hub upload) works exactly as in
   upstream LeLab.
 

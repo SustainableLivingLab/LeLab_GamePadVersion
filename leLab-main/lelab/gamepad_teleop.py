@@ -65,6 +65,12 @@ BUTTON_HOME = 3  # Triangle
 # away doesn't yank the arm at full speed.
 HOME_MOVE_DURATION_S = 1.5
 
+# How often to retry opening the joystick after it drops mid-session
+# (Bluetooth hiccup, dongle out of range, USB unplug). A Joystick() open can
+# take noticeably longer than one control tick, so this is throttled rather
+# than attempted every get_action() call.
+RECONNECT_INTERVAL_S = 1.0
+
 # Which stick axis drives each joint, its sign, and how fast it moves
 # (degrees/sec at full stick deflection).
 JOINT_CONFIG = {
@@ -183,6 +189,13 @@ class GamepadSO101Teleop(Teleoperator):
         self._quit_requested = False
         # Set via seed(); used to service a Triangle press without a robot reference.
         self._robot = None
+        # A dropped controller (Bluetooth hiccup, dongle out of range, USB
+        # unplug) shouldn't crash the whole teleop/recording session -- see
+        # get_action()'s try/except. These track that degraded state so the
+        # GUI can show it and so reconnect attempts are rate-limited instead
+        # of retrying a slow Joystick() open every single control tick.
+        self._gamepad_connected = True
+        self._last_reconnect_attempt = 0.0
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -243,43 +256,94 @@ class GamepadSO101Teleop(Teleoperator):
         self._home_position = dict(present)
         self._running = False
 
+    def _attempt_reconnect(self) -> bool:
+        """Try to re-open the joystick after a drop. Rate-limited by
+        RECONNECT_INTERVAL_S so a persistently-gone controller doesn't stall
+        the control loop retrying every tick. Returns True once a fresh
+        Joystick() open AND a real read both succeed -- a successful open
+        alone can still be a zombie handle on some drivers.
+        """
+        now = time.perf_counter()
+        if now - self._last_reconnect_attempt < RECONNECT_INTERVAL_S:
+            return False
+        self._last_reconnect_attempt = now
+
+        pygame = self._pygame
+        try:
+            pygame.joystick.quit()
+            pygame.joystick.init()
+            pygame.event.pump()
+            if pygame.joystick.get_count() == 0:
+                return False
+            joystick = pygame.joystick.Joystick(self.config.joystick_index)
+            joystick.init()
+            joystick.get_axis(0)  # confirms the handle actually reads, not just opens
+        except Exception:
+            return False
+
+        self._joystick = joystick
+        self._gamepad_connected = True
+        logger.info("Gamepad reconnected: %s", joystick.get_name())
+        return True
+
     @check_if_not_connected
     def get_action(self) -> dict[str, float]:
         if self._targets is None:
             raise RuntimeError("GamepadSO101Teleop.seed(robot) must be called before get_action().")
 
+        if not self._gamepad_connected:
+            if not self._attempt_reconnect():
+                # Still gone: hold the arm exactly where it is and skip
+                # every button/stick read below rather than raise -- a
+                # raised exception here would crash the whole teleop worker
+                # (or lerobot's record_loop, in recording mode) and, worse,
+                # take the follower arm's connection down with it.
+                return {f"{joint}.pos": val for joint, val in self._targets.items()}
+
         pygame = self._pygame
-        pygame.event.pump()
+        try:
+            pygame.event.pump()
 
-        if self._joystick.get_button(BUTTON_QUIT):
-            self._quit_requested = True
+            if self._joystick.get_button(BUTTON_QUIT):
+                self._quit_requested = True
 
-        if self._joystick.get_button(BUTTON_START_PAUSE):
-            if not self._start_pause_held:
-                self._start_pause_held = True
-                self._running = not self._running
-                if self._running and self._robot is not None:
-                    self._targets = dict(self._robot.bus.sync_read("Present_Position"))
-                logger.info("Gamepad arm motion %s.", "ON" if self._running else "OFF (holding position)")
-        else:
+            if self._joystick.get_button(BUTTON_START_PAUSE):
+                if not self._start_pause_held:
+                    self._start_pause_held = True
+                    self._running = not self._running
+                    if self._running and self._robot is not None:
+                        self._targets = dict(self._robot.bus.sync_read("Present_Position"))
+                    logger.info("Gamepad arm motion %s.", "ON" if self._running else "OFF (holding position)")
+            else:
+                self._start_pause_held = False
+
+            if self._joystick.get_button(BUTTON_HOME):
+                if not self._home_held:
+                    self._home_held = True
+                    if self._running and self._robot is not None:
+                        self._targets = move_to_home(
+                            self._robot.bus, self._targets, self._home_position, self.config.fps, HOME_MOVE_DURATION_S
+                        )
+            else:
+                self._home_held = False
+
+            now = time.perf_counter()
+            dt = (now - self._last_tick) if self._last_tick is not None else (1.0 / self.config.fps)
+            self._last_tick = now
+
+            if self._running:
+                step_targets(self._joystick, self._targets, dt)
+        except Exception as e:
+            # The controller went away mid-read (Bluetooth hiccup, dongle out
+            # of range, USB unplug). Freeze the arm in place -- force
+            # `_running` off so a later reconnect doesn't resume mid-motion
+            # from stale stick state -- and let future ticks retry the
+            # connection instead of tearing down the session.
+            logger.warning("Gamepad read failed, will retry: %s", e)
+            self._gamepad_connected = False
+            self._running = False
             self._start_pause_held = False
-
-        if self._joystick.get_button(BUTTON_HOME):
-            if not self._home_held:
-                self._home_held = True
-                if self._running and self._robot is not None:
-                    self._targets = move_to_home(
-                        self._robot.bus, self._targets, self._home_position, self.config.fps, HOME_MOVE_DURATION_S
-                    )
-        else:
             self._home_held = False
-
-        now = time.perf_counter()
-        dt = (now - self._last_tick) if self._last_tick is not None else (1.0 / self.config.fps)
-        self._last_tick = now
-
-        if self._running:
-            step_targets(self._joystick, self._targets, dt)
 
         return {f"{joint}.pos": val for joint, val in self._targets.items()}
 
@@ -288,7 +352,11 @@ class GamepadSO101Teleop(Teleoperator):
         (e.g. to surface a "quit requested" toast). Circle (BUTTON_QUIT) latches
         `quit_requested` until explicitly cleared by the caller.
         """
-        return {"running": self._running, "quit_requested": self._quit_requested}
+        return {
+            "running": self._running,
+            "quit_requested": self._quit_requested,
+            "gamepad_connected": self._gamepad_connected,
+        }
 
     def clear_quit_requested(self) -> None:
         self._quit_requested = False
@@ -298,7 +366,13 @@ class GamepadSO101Teleop(Teleoperator):
 
     def disconnect(self) -> None:
         if self._joystick is not None:
-            self._joystick.quit()
+            try:
+                self._joystick.quit()
+            except Exception:
+                # The handle may already be dead if the controller dropped
+                # and was never successfully reconnected -- teardown must
+                # still proceed.
+                pass
             self._joystick = None
         if self._pygame is not None:
             self._pygame.joystick.quit()

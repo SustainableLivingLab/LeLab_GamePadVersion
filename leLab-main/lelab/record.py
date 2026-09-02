@@ -47,6 +47,10 @@ recording_thread: threading.Thread | None = None
 # /camera-feed endpoint can peek its cameras' latest frames. Reset to None on
 # teardown. Always gated behind `recording_active` by readers.
 current_robot = None
+# Live teleoperator (gamepad or leader) for the active session, set once it
+# connects so /recording-status can surface gamepad connectivity the same way
+# /teleoperation-status does. Reset to None on teardown.
+current_teleop = None
 recording_events = None  # Events dict for controlling recording session
 recording_config = None  # Store recording configuration
 recording_start_time = None  # Track when recording started
@@ -469,6 +473,20 @@ def handle_recording_status() -> dict[str, Any]:
     if recording_config:
         status["dataset_repo_id"] = recording_config.dataset_repo_id
 
+    if recording_active and isinstance(current_teleop, GamepadSO101Teleop):
+        events = current_teleop.get_teleop_events()
+        name = None
+        if events["gamepad_connected"] and current_teleop._joystick is not None:
+            try:
+                name = current_teleop._joystick.get_name()
+            except Exception:
+                name = None
+        status["gamepad"] = {
+            "connected": events["gamepad_connected"],
+            "name": name,
+            "running": events["running"],
+        }
+
     # Carry the failure reason and how much of the session survived it, so the
     # frontend can offer a partial dataset for upload and only send the user
     # home when nothing was saved.
@@ -704,7 +722,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
     from lerobot.utils.feature_utils import hw_to_dataset_features
     from lerobot.utils.utils import log_say
 
-    global current_phase, phase_start_time, current_episode, saved_episodes, current_robot
+    global current_phase, phase_start_time, current_episode, saved_episodes, current_robot, current_teleop
 
     robot = make_robot_from_config(cfg.robot)
     if isinstance(cfg.teleop, GamepadSO101TeleopConfig):
@@ -828,6 +846,9 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
         # only after the cameras are connected so the feed never peeks a
         # half-open device.
         current_robot = robot
+        # Exposed so /recording-status can surface gamepad connectivity the
+        # same way /teleoperation-status does.
+        current_teleop = teleop
 
         while saved_episodes < cfg.dataset.num_episodes:
             # RECORDING PHASE - with dataset (matches original record.py exactly)
@@ -995,6 +1016,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
         # Stop the camera-feed endpoint from reading before tearing the cameras
         # down, so it can't peek a half-disconnected device.
         current_robot = None
+        current_teleop = None
         try:
             # Writes the parquet footers for meta/episodes/. Without it the
             # dataset is invalid on disk, so reopening it (upload,

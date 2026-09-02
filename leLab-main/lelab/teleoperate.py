@@ -383,15 +383,18 @@ def handle_teleoperation_status() -> dict[str, Any]:
     }
 
     if teleoperation_active and isinstance(current_teleop, GamepadSO101Teleop):
+        events = current_teleop.get_teleop_events()
         gamepad_name = None
-        if current_teleop._joystick is not None:
+        if events["gamepad_connected"] and current_teleop._joystick is not None:
             try:
                 gamepad_name = current_teleop._joystick.get_name()
             except Exception:
                 gamepad_name = None
-        events = current_teleop.get_teleop_events()
         status["gamepad"] = {
-            "connected": current_teleop.is_connected,
+            # Whether the physical controller is currently reachable -- can go
+            # False mid-session (Bluetooth hiccup, dongle range, USB unplug)
+            # while the session itself keeps running and auto-retries.
+            "connected": events["gamepad_connected"],
             "name": gamepad_name,
             "running": events["running"],
         }

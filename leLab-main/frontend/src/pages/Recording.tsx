@@ -26,6 +26,7 @@ import {
   playAutoAdvanceWarning,
 } from "@/lib/recordingAudio";
 import { useApi } from "@/contexts/ApiContext";
+import GamepadStatusBadge from "@/components/control/GamepadStatusBadge";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -550,6 +551,7 @@ const Recording = () => {
 
         <div className="bg-gray-900 rounded-lg border border-gray-700 p-6 flex-1 min-h-0 flex flex-col justify-center">
           <div className="flex justify-end items-center gap-4 mb-3 flex-shrink-0 text-sm text-gray-400">
+            <GamepadStatusBadge source="recording" />
             <span aria-label={`Episode ${currentEpisode} of ${totalEpisodes}`}>
               Episode <span className="text-white font-semibold">{currentEpisode}</span> / {totalEpisodes}
             </span>

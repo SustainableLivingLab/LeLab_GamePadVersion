@@ -185,17 +185,22 @@ def handle_gamepad_status() -> dict[str, Any]:
         gamepad_probe.close()
 
         teleop = _teleoperate.current_teleop
+        events = teleop.get_teleop_events()
         name = None
-        if teleop._joystick is not None:
+        if events["gamepad_connected"] and teleop._joystick is not None:
             try:
                 name = teleop._joystick.get_name()
             except Exception:
                 name = None
-        events = teleop.get_teleop_events()
         return {
-            "connected": teleop.is_connected,
+            # Physical-controller reachability, not the Teleoperator's logical
+            # connection (which stays True across a mid-session drop so the
+            # gamepad can auto-reconnect without tearing the session down).
+            "connected": events["gamepad_connected"],
             "name": name,
-            "message": "Gamepad is in use by the active teleoperation session.",
+            "message": "Gamepad is in use by the active teleoperation session."
+            if events["gamepad_connected"]
+            else "Gamepad disconnected mid-session -- retrying automatically.",
             "in_session": True,
             "running": events["running"],
         }
