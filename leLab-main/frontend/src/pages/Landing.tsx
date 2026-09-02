@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { ChevronsUpDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
@@ -46,11 +46,31 @@ const Landing = () => {
   const [resetTimeS, setResetTimeS] = useState(15);
   const [streamingEncoding, setStreamingEncoding] = useState(true);
   const [cameras, setCameras] = useState<CameraConfig[]>([]);
+  // Set when arriving here to resume a specific already-recorded dataset
+  // (e.g. from the Upload page's "Continue Recording" button when no robot
+  // was already known). Locks the dataset name field to this exact repo_id
+  // and forces resume=true instead of building a fresh namespaced id.
+  const [resumeRepoId, setResumeRepoId] = useState<string | null>(null);
 
   const releaseStreamsRef = useRef<(() => void) | null>(null);
 
   const navigate = useNavigate();
+  const location = useLocation();
   const { toast } = useToast();
+
+  // Open the recording modal pre-filled to resume a dataset, if we arrived
+  // here via navigate("/", { state: { resumeDatasetRepoId } }).
+  useEffect(() => {
+    const repoId = (location.state as { resumeDatasetRepoId?: string } | null)
+      ?.resumeDatasetRepoId;
+    if (!repoId) return;
+    setResumeRepoId(repoId);
+    setDatasetName(repoId);
+    setShowRecordingModal(true);
+    // Clear the navigation state so a later plain visit to "/" (back button,
+    // refresh) doesn't re-open the modal.
+    navigate(".", { replace: true, state: null });
+  }, [location.state, navigate]);
 
   // Clear camera state and release streams when returning to landing page
   useEffect(() => {
@@ -81,9 +101,12 @@ const Landing = () => {
 
   const handleRecordingModalClose = (open: boolean) => {
     setShowRecordingModal(open);
-    if (!open && releaseStreamsRef.current) {
-      console.log("🧹 Modal closed: Releasing camera streams");
-      releaseStreamsRef.current();
+    if (!open) {
+      setResumeRepoId(null);
+      if (releaseStreamsRef.current) {
+        console.log("🧹 Modal closed: Releasing camera streams");
+        releaseStreamsRef.current();
+      }
     }
   };
 
@@ -150,8 +173,11 @@ const Landing = () => {
       return;
     }
 
-    const datasetRepoId =
-      auth.status === "authenticated"
+    // When resuming, datasetName already holds the exact existing repo_id --
+    // don't re-namespace it into a new one.
+    const datasetRepoId = resumeRepoId
+      ? datasetName
+      : auth.status === "authenticated"
         ? `${auth.username}/${datasetName}`
         : datasetName;
 
@@ -212,7 +238,7 @@ const Landing = () => {
       fps: 30,
       video: true,
       push_to_hub: false,
-      resume: false,
+      resume: !!resumeRepoId,
       streaming_encoding: streamingEncoding,
       cameras: cameraDict,
     };
@@ -316,6 +342,7 @@ const Landing = () => {
         setCameras={setCameras}
         onStart={handleStartRecording}
         releaseStreamsRef={releaseStreamsRef}
+        resumeRepoId={resumeRepoId}
       />
     </div>
   );

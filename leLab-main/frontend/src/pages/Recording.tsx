@@ -269,7 +269,11 @@ const Recording = () => {
             saved_episodes: status.saved_episodes || 0,
             session_elapsed_seconds: status.session_elapsed_seconds || 0,
           };
-          navigate("/upload", { state: { datasetInfo } });
+          // Carried forward so the Upload page's "Continue Recording" button
+          // can jump straight back into a resumed session with the same
+          // robot connection (ports, calibration, cameras) without asking
+          // the user to re-enter it.
+          navigate("/upload", { state: { datasetInfo, recordingConfig } });
         }
       } catch (error) {
         console.error("Error polling recording status:", error);

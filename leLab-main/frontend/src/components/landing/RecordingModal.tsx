@@ -44,6 +44,10 @@ interface RecordingModalProps {
   setCameras: (cameras: CameraConfig[]) => void;
   onStart: () => void;
   releaseStreamsRef?: React.MutableRefObject<(() => void) | null>;
+  /** Set when resuming an existing dataset (e.g. from the Upload page's
+   * "Continue Recording" button): locks the dataset name field to this
+   * exact repo_id instead of letting it build a new namespaced one. */
+  resumeRepoId?: string | null;
 }
 
 const RecordingModal: React.FC<RecordingModalProps> = ({
@@ -66,6 +70,7 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
   setCameras,
   onStart,
   releaseStreamsRef,
+  resumeRepoId,
 }) => {
   const { auth } = useHfAuth();
 
@@ -81,12 +86,14 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
             </div>
           </div>
           <DialogTitle className="text-white text-center text-2xl font-bold">
-            Configure Recording
+            {resumeRepoId ? "Resume Recording" : "Configure Recording"}
           </DialogTitle>
         </DialogHeader>
         <div className="space-y-6 py-4">
           <DialogDescription className="text-gray-400 text-base leading-relaxed text-center">
-            Pick a configured robot and dataset parameters for recording.
+            {resumeRepoId
+              ? "Pick a configured robot to continue collecting episodes for this dataset."
+              : "Pick a configured robot and dataset parameters for recording."}
           </DialogDescription>
 
           <div className="grid grid-cols-1 gap-6">
@@ -135,32 +142,42 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                   <Input
                     id="datasetName"
                     value={datasetName}
+                    disabled={!!resumeRepoId}
                     onChange={(e) =>
                       setDatasetName(
                         e.target.value.replace(/[^A-Za-z0-9._-]/g, "_")
                       )
                     }
                     placeholder="my_dataset"
-                    className="bg-gray-800 border-gray-700 text-white"
+                    className="bg-gray-800 border-gray-700 text-white disabled:opacity-100 disabled:text-gray-300"
                   />
-                  <p className="text-xs text-gray-500">
-                    Letters, numbers, <code>.</code> <code>_</code>{" "}
-                    <code>-</code> only — other characters become{" "}
-                    <code>_</code>.
-                  </p>
-                  {datasetName &&
-                    (auth.status === "authenticated" ? (
+                  {resumeRepoId ? (
+                    <p className="text-xs text-green-400/90">
+                      Resuming this existing dataset: new episodes will be
+                      appended to it, and its name can't be changed here.
+                    </p>
+                  ) : (
+                    <>
                       <p className="text-xs text-gray-500">
-                        Will be saved as{" "}
-                        <span className="text-gray-300 font-mono">
-                          {auth.username}/{datasetName}
-                        </span>
+                        Letters, numbers, <code>.</code> <code>_</code>{" "}
+                        <code>-</code> only — other characters become{" "}
+                        <code>_</code>.
                       </p>
-                    ) : auth.status === "unauthenticated" ? (
-                      <p className="text-xs text-amber-400/80">
-                        Log in to Hugging Face to set the repository owner.
-                      </p>
-                    ) : null)}
+                      {datasetName &&
+                        (auth.status === "authenticated" ? (
+                          <p className="text-xs text-gray-500">
+                            Will be saved as{" "}
+                            <span className="text-gray-300 font-mono">
+                              {auth.username}/{datasetName}
+                            </span>
+                          </p>
+                        ) : auth.status === "unauthenticated" ? (
+                          <p className="text-xs text-amber-400/80">
+                            Log in to Hugging Face to set the repository owner.
+                          </p>
+                        ) : null)}
+                    </>
+                  )}
                 </div>
                 <div className="space-y-2">
                   <Label

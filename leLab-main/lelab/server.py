@@ -56,6 +56,7 @@ from .record import (
     handle_delete_dataset,
     handle_exit_early,
     handle_get_dataset_info,
+    handle_list_local_datasets,
     handle_recording_status,
     handle_rerecord_episode,
     handle_start_recording,
@@ -488,6 +489,12 @@ def upload_dataset(request: UploadRequest):
 def get_dataset_info(request: DatasetInfoRequest):
     """Get information about a saved dataset"""
     return handle_get_dataset_info(request)
+
+
+@app.get("/local-datasets")
+def list_local_datasets_endpoint():
+    """List datasets saved on local disk, for the "Continue a paused dataset" picker."""
+    return handle_list_local_datasets()
 
 
 @app.post("/delete-dataset")

@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { NumberInput } from "@/components/ui/number-input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -17,6 +18,7 @@ import {
   AlertCircle,
   Loader2,
   Trash2,
+  PlayCircle,
 } from "lucide-react";
 import { useApi } from "@/contexts/ApiContext";
 import { DatasetSource } from "@/lib/replayApi";
@@ -48,6 +50,28 @@ interface UploadConfig {
   private: boolean;
 }
 
+// The connection details a recording session needs to restart. Carried
+// forward from the Recording page's navigation state (not present when this
+// page is reached some other way, e.g. from the dataset browser).
+interface RecordingConfig {
+  input_mode: string;
+  leader_port: string;
+  follower_port: string;
+  leader_config: string;
+  follower_config: string;
+  dataset_repo_id: string;
+  single_task: string;
+  num_episodes: number;
+  episode_time_s: number;
+  reset_time_s: number;
+  fps: number;
+  video: boolean;
+  push_to_hub: boolean;
+  resume: boolean;
+  streaming_encoding: boolean;
+  cameras?: unknown;
+}
+
 const Upload = () => {
   const location = useLocation();
   const navigate = useNavigate();
@@ -56,6 +80,11 @@ const Upload = () => {
 
   // Get initial dataset info from navigation state
   const initialDatasetInfo = location.state?.datasetInfo as DatasetInfo;
+  // Only present when this page was reached from an actual recording
+  // session (not e.g. the dataset browser) -- gates the Continue button.
+  const recordingConfig = location.state?.recordingConfig as
+    | RecordingConfig
+    | undefined;
 
   // State for actual dataset info (will be loaded from backend)
   const [datasetInfo, setDatasetInfo] = useState<DatasetInfo | null>(null);
@@ -72,6 +101,8 @@ const Upload = () => {
   const [uploadSuccess, setUploadSuccess] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [showContinueDialog, setShowContinueDialog] = useState(false);
+  const [continueEpisodes, setContinueEpisodes] = useState(5);
 
   // Load actual dataset information from backend
   React.useEffect(() => {
@@ -223,6 +254,29 @@ const Upload = () => {
       description: "Dataset saved locally. You can upload it manually later.",
     });
     navigate("/");
+  };
+
+  const handleContinueRecording = () => {
+    if (!datasetInfo) return;
+    if (recordingConfig) {
+      // Robot connection is already known (arrived here right after a
+      // session ended) -- jump straight back into recording.
+      navigate("/recording", {
+        state: {
+          recordingConfig: {
+            ...recordingConfig,
+            dataset_repo_id: datasetInfo.dataset_repo_id,
+            num_episodes: continueEpisodes,
+            resume: true,
+          },
+        },
+      });
+      return;
+    }
+    // Arrived here via the dataset picker (e.g. much later, new page load) --
+    // no robot connection is known, so send the user through the normal
+    // recording setup modal, pre-filled to resume this exact dataset.
+    navigate("/", { state: { resumeDatasetRepoId: datasetInfo.dataset_repo_id } });
   };
 
   const handleDeleteDataset = async () => {
@@ -459,6 +513,22 @@ const Upload = () => {
               </div>
             )}
 
+            {/* Continue Recording */}
+            <div className="flex flex-col sm:flex-row gap-4 justify-center mb-4">
+              <Button
+                onClick={() =>
+                  recordingConfig
+                    ? setShowContinueDialog(true)
+                    : handleContinueRecording()
+                }
+                variant="outline"
+                className="border-green-600 text-green-400 hover:bg-green-900/20 hover:text-green-300 py-4 px-8 text-lg"
+              >
+                <PlayCircle className="w-5 h-5 mr-2" />
+                Continue Recording This Dataset
+              </Button>
+            </div>
+
             {/* Action Buttons */}
             <div className="flex flex-col sm:flex-row gap-4 justify-center">
               {isAlreadyOnHub ? (
@@ -554,6 +624,47 @@ const Upload = () => {
               className="bg-red-500 hover:bg-red-600 text-white"
             >
               {isDeleting ? "Deleting…" : "Delete"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={showContinueDialog} onOpenChange={setShowContinueDialog}>
+        <AlertDialogContent className="bg-gray-900 border-gray-700 text-white">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Continue recording this dataset?</AlertDialogTitle>
+            <AlertDialogDescription className="text-gray-400">
+              Reconnects to the same robot and appends more episodes to{" "}
+              <span className="font-mono text-white">
+                {datasetInfo?.dataset_repo_id}
+              </span>
+              . Existing episodes are kept as-is.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-2 py-2">
+            <Label htmlFor="continueEpisodes" className="text-gray-300">
+              How many more episodes?
+            </Label>
+            <NumberInput
+              id="continueEpisodes"
+              min="1"
+              max="100"
+              value={continueEpisodes}
+              onChange={(v) => {
+                if (v !== undefined) setContinueEpisodes(v);
+              }}
+              className="bg-gray-800 border-gray-600 text-white"
+            />
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="bg-gray-800 border-gray-700 text-white hover:bg-gray-700">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleContinueRecording}
+              className="bg-green-600 hover:bg-green-700 text-white"
+            >
+              Continue Recording
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

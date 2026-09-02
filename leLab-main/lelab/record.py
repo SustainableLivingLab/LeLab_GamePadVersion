@@ -30,8 +30,10 @@ from lerobot.robots.so_follower import SO101FollowerConfig
 # Import the main record functionality to reuse it
 from lerobot.scripts.lerobot_record import RecordConfig
 from lerobot.teleoperators.so_leader import SO101LeaderConfig
+from lerobot.utils.constants import HF_LEROBOT_HOME
 
 from .dataset_repair import DatasetRepairError, repair_local_dataset
+from .datasets import list_local_datasets
 from .gamepad_teleop import GamepadSO101Teleop, GamepadSO101TeleopConfig
 from .utils.config import setup_calibration_files, with_lelab_tag
 from .utils.devices import safe_disconnect_device
@@ -183,10 +185,16 @@ def create_record_config(request: RecordingRequest) -> RecordConfig:
         else SO101LeaderConfig(port=request.leader_port, id=leader_config_name)
     )
 
-    # Create dataset config
+    # Create dataset config. `root` must be explicit when resuming --
+    # LeRobotDataset.resume() raises if root is None (it would otherwise have
+    # to write into the revision-safe Hub snapshot cache, which resume()
+    # refuses to do). $HF_LEROBOT_HOME/<repo_id> is the same location a fresh
+    # (non-resumed) recording already lands in by default, so this is a no-op
+    # for the non-resume path and the fix resume() actually needs.
     dataset_config = DatasetRecordConfig(
         repo_id=request.dataset_repo_id,
         single_task=request.single_task,
+        root=str(HF_LEROBOT_HOME / request.dataset_repo_id) if request.resume else None,
         num_episodes=request.num_episodes,
         episode_time_s=request.episode_time_s,
         reset_time_s=request.reset_time_s,
@@ -584,12 +592,24 @@ def handle_get_dataset_info(request: DatasetInfoRequest) -> dict[str, Any]:
         }
 
 
+def handle_list_local_datasets() -> dict[str, Any]:
+    """List datasets saved on local disk, for the "Continue a paused dataset"
+    picker. Any local dataset is a valid resume target -- lerobot's own
+    LeRobotDataset.resume() has no notion of "incomplete", it just appends
+    more episodes to whatever's already there -- so this is deliberately not
+    filtered down to some guessed-at "unfinished" subset.
+    """
+    try:
+        return {"success": True, "datasets": list_local_datasets()}
+    except Exception as e:
+        logger.error(f"Failed to list local datasets: {e}")
+        return {"success": False, "message": str(e), "datasets": []}
+
+
 def handle_delete_dataset(request: DatasetInfoRequest) -> dict[str, Any]:
     """Remove a recorded dataset's directory from local disk."""
     global last_recording_info
     from pathlib import Path
-
-    from lerobot.utils.constants import HF_LEROBOT_HOME
 
     repo_id = request.dataset_repo_id
     root = Path(HF_LEROBOT_HOME).resolve()
