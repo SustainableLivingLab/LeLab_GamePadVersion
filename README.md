@@ -165,12 +165,13 @@ Python backend on `:8000` (auto-restarts on file save). Open `http://localhost:8
 4. Click the **gear icon (Configure)** on the tile. Pick the follower's serial port (use the
    auto-detect button if you're not sure which one it is), then run through calibration.
    It's a short guided flow, just follow the on-screen instructions.
-5. Back on the landing page, plug in your gamepad if you haven't yet. Click the **small
-   controller icon (Test gamepad)** next to the dropdown (visible before you've even picked a
-   robot, and again on the tile in gamepad mode). It opens a live view of your controller's
-   sticks and buttons. Wiggle the sticks and press some buttons; you should see the bars and
-   button grid react in real time. If nothing reacts, see **Troubleshooting → Gamepad not
-   detected** below.
+5. Back on the landing page, click the **small controller icon (Test gamepad)** next to the
+   dropdown (visible before you've even picked a robot, and again on the tile in gamepad mode).
+   If no controller is detected yet, this view shows step-by-step setup instructions for **Wired
+   USB**, **2.4G Dongle**, and **Bluetooth**; pick whichever way you're connecting and follow the
+   steps. Once detected, it switches to a live view of your controller's sticks and buttons:
+   wiggle the sticks and press some buttons, and you should see the bars and button grid react in
+   real time. If nothing reacts, see **Troubleshooting → Gamepad not detected** below.
 6. Once the tile shows **"Ready"** (green), click **Teleoperation**. Press **Cross (✕ / A)** on
    the controller to start driving the arm. See **Default Gamepad Controls** below for the full
    mapping.
@@ -285,7 +286,12 @@ particular error means, copy the full error text (not just the last line) before
   completely untouched; this is purely additive.
 - **Live gamepad test view**: a "Test gamepad" button shows real-time stick/button/D-pad values
   in the browser, so you can confirm your controller is detected and mapped correctly before
-  trusting it with the robot.
+  trusting it with the robot. When nothing's detected yet, it also walks you through connecting
+  via Wired USB, a 2.4G Dongle, or Bluetooth.
+- **Pause, continue, and publish a recording**: stopping a recording session always saves what
+  was collected so far to a valid local dataset. The page you land on afterward offers a
+  "Continue Recording" button to append more episodes later (with the same robot connection
+  carried forward automatically), alongside the existing Hub upload flow.
 - Everything else (calibration, camera setup, training, replay, Hub upload) works exactly as in
   upstream LeLab.
 
