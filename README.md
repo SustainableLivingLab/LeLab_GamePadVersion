@@ -32,14 +32,21 @@ machine already has.
 Open PowerShell and paste:
 
 ```powershell
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git#subdirectory=leLab-main" --torch-backend cpu --reinstall; lelab
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git#subdirectory=leLab-main" --torch-backend auto --reinstall; lelab
 ```
 
-Your browser should open automatically to `http://localhost:8000`. The first run downloads
-everything the app needs (a few hundred MB), so expect it to take a few minutes; every run after
-that starts in seconds.
+`--torch-backend auto` picks the right PyTorch build for your machine automatically: a CUDA build
+if you have an NVIDIA GPU and driver, otherwise a CPU-only build. You don't need to know which one
+you're getting; either way, calibration, gamepad teleoperation, and recording all work the same.
+A GPU only matters for local policy rollout speed (training itself runs on Hugging Face's cloud,
+not your machine).
 
-**To run it again later** (no need to repeat the install), just open PowerShell and run:
+Your browser should open automatically to `http://localhost:8000`. The first run downloads
+everything the app needs (a few hundred MB on CPU, more with a GPU build), so expect it to take a
+few minutes; every run after that starts in seconds.
+
+**To run it again later** (no need to repeat the install), plug in your gamepad and the SO-101
+follower arm, then open PowerShell and run:
 
 ```powershell
 lelab
@@ -77,10 +84,10 @@ step: useful if the one-liner didn't work, or if you want to see/edit the source
   can skip this, since the built frontend is already included in this repo). Download:
   <https://nodejs.org/> (choose the LTS version).
 
-You do **not** need a leader arm or a GPU. Training a policy runs on Hugging Face's cloud
+You do **not** need a leader arm. A GPU is optional: training a policy runs on Hugging Face's cloud
 infrastructure, not on your machine, so a plain CPU-only PyTorch install (what `pip install -e .`
-gives you by default) is all this app ever needs locally: calibration, gamepad teleoperation, and
-recording all run fine on it.
+gives you by default) is all calibration, gamepad teleoperation, and recording ever need locally.
+A local GPU only speeds up local policy rollout, if you use that feature.
 
 ### Step 1: Get the code
 
@@ -126,8 +133,8 @@ lines (deprecation notices, script-not-on-PATH notices) are harmless and expecte
 - **`'pip' is not recognized`**: Python wasn't added to PATH during install. Reinstall Python
   and tick "Add python.exe to PATH", or run `python -m pip install -e .` instead of bare `pip`.
 - **A `torch`/CUDA-related error**: usually means pip picked a CUDA build that doesn't match your
-  GPU driver. This app never needs a GPU (training runs on Hugging Face's cloud, not your
-  machine), so just force the CPU build and move on:
+  GPU driver. This app doesn't require a GPU (training runs on Hugging Face's cloud, not your
+  machine; a local GPU only speeds up local policy rollout), so just force the CPU build and move on:
   ```powershell
   pip install torch --index-url https://download.pytorch.org/whl/cpu
   pip install -e .
