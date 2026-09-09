@@ -16,11 +16,50 @@ teleoperation *and* dataset recording, as a full alternative to a leader arm. Yo
 input mode per-robot in the GUI with a toggle switch.
 
 Everything below is written for someone setting this up **for the first time, on a computer that
-has never run it before.** Follow it top to bottom in order.
+has never run it before.** There are two ways in: a single command (below), or a step-by-step
+manual setup further down for anyone who wants to see the code as they go.
 
 ---
 
-## What you need before starting
+## Quick Start (one command)
+
+If you just want to run LeLab GamePad Version and don't plan to edit the code, this single
+command does everything: installs [uv](https://docs.astral.sh/uv/) (a fast Python package
+manager) if it isn't already on your machine, installs LeLab GamePad Version with it, and starts
+the app. Nothing else needs to be pre-installed except PowerShell itself, which every Windows
+machine already has.
+
+Open PowerShell and paste:
+
+```powershell
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git#subdirectory=leLab-main" --torch-backend cpu --reinstall; lelab
+```
+
+Your browser should open automatically to `http://localhost:8000`. The first run downloads
+everything the app needs (a few hundred MB), so expect it to take a few minutes; every run after
+that starts in seconds.
+
+**To run it again later** (no need to repeat the install), just open PowerShell and run:
+
+```powershell
+lelab
+```
+
+**To update to the latest version** later, run the same one-liner again: `--reinstall` makes it
+fetch and install the current code fresh, even if you already have a version installed.
+
+If this fails for any reason, or you want to see/edit the actual source code, follow the manual
+setup below instead: it's the same install, just done step by step so you can see what's
+happening at each stage.
+
+---
+
+## Manual setup
+
+Everything below is the same install the Quick Start one-liner does, just spelled out step by
+step: useful if the one-liner didn't work, or if you want to see/edit the source code.
+
+### What you need before starting
 
 - **A Windows, macOS, or Linux computer.** (This guide's exact commands are for Windows +
   PowerShell; macOS/Linux users run the same steps in a regular terminal, swapping backslashes for
@@ -38,14 +77,12 @@ has never run it before.** Follow it top to bottom in order.
   can skip this, since the built frontend is already included in this repo). Download:
   <https://nodejs.org/> (choose the LTS version).
 
-You do **not** need a leader arm. A GPU is optional: it speeds up training a policy, but
-calibration, gamepad teleoperation, and recording all run fine on CPU-only machines too. If you
-do have an NVIDIA GPU, `pip install -e .` picks a CUDA-enabled PyTorch build automatically as
-long as your NVIDIA drivers are installed; nothing extra to configure.
+You do **not** need a leader arm or a GPU. Training a policy runs on Hugging Face's cloud
+infrastructure, not on your machine, so a plain CPU-only PyTorch install (what `pip install -e .`
+gives you by default) is all this app ever needs locally: calibration, gamepad teleoperation, and
+recording all run fine on it.
 
----
-
-## Step 1: Get the code
+### Step 1: Get the code
 
 Open a terminal (PowerShell on Windows) and run:
 
@@ -68,7 +105,7 @@ Get-Location   # should end in ...\LeLab_GamePadVersion\leLab-main
 pwd            # should end in .../LeLab_GamePadVersion/leLab-main
 ```
 
-## Step 2: Install LeLab (Python side)
+### Step 2: Install LeLab (Python side)
 
 Still inside `leLab-main`, run:
 
@@ -89,20 +126,12 @@ lines (deprecation notices, script-not-on-PATH notices) are harmless and expecte
 - **`'pip' is not recognized`**: Python wasn't added to PATH during install. Reinstall Python
   and tick "Add python.exe to PATH", or run `python -m pip install -e .` instead of bare `pip`.
 - **A `torch`/CUDA-related error**: usually means pip picked a CUDA build that doesn't match your
-  GPU driver (or you don't have an NVIDIA GPU at all). Either update your GPU driver and retry, or
-  fall back to a CPU-only build; gamepad teleoperation and recording work fine without a GPU, you'd
-  only lose GPU-accelerated training:
+  GPU driver. This app never needs a GPU (training runs on Hugging Face's cloud, not your
+  machine), so just force the CPU build and move on:
   ```powershell
   pip install torch --index-url https://download.pytorch.org/whl/cpu
   pip install -e .
   ```
-  If you *do* have an NVIDIA GPU and want to use it, install a matching CUDA build instead, e.g.:
-  ```powershell
-  pip install torch --index-url https://download.pytorch.org/whl/cu128
-  pip install -e .
-  ```
-  (pick the `cuXXX` matching your installed CUDA version; see
-  <https://pytorch.org/get-started/locally/> if unsure).
 - **Anything mentioning `av`, `datasets`, or `torchcodec`**: run the install again; these
   sometimes need a second pass to resolve on a fresh machine:
   ```powershell
@@ -115,7 +144,7 @@ lines (deprecation notices, script-not-on-PATH notices) are harmless and expecte
   pip install opencv-python
   ```
 
-## Step 3: Confirm the install
+### Step 3: Confirm the install
 
 ```powershell
 lelab --help
@@ -126,7 +155,7 @@ you get `'lelab' is not recognized`, the install succeeded but the `lelab` comma
 PATH: either close and reopen your terminal (this fixes it 90% of the time on Windows), or run
 it as `python -m lelab.scripts.lelab --help` instead everywhere in this guide.
 
-## Step 4: Run it
+### Step 4: Run it
 
 For everyday use (this is what you want almost every time):
 
@@ -155,7 +184,7 @@ lelab --dev
 This runs two servers together: a Vite frontend on `:8080` (hot-reloads on file save) and the
 Python backend on `:8000` (auto-restarts on file save). Open `http://localhost:8080`.
 
-## Step 5: First-time setup inside the app
+### Step 5: First-time setup inside the app
 
 1. **Plug in the follower arm** via USB, if you haven't already.
 2. On the landing page, click the robot name dropdown → type a name → **Create**.
