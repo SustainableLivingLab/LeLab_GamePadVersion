@@ -41,9 +41,10 @@ const Landing = () => {
   const [showRecordingModal, setShowRecordingModal] = useState(false);
   const [datasetName, setDatasetName] = useState("");
   const [singleTask, setSingleTask] = useState("");
-  const [numEpisodes, setNumEpisodes] = useState(5);
-  const [episodeTimeS, setEpisodeTimeS] = useState(60);
-  const [resetTimeS, setResetTimeS] = useState(15);
+  const [numEpisodes, setNumEpisodes] = useState(30);
+  const [timedSessions, setTimedSessions] = useState(false);
+  const [episodeTimeS, setEpisodeTimeS] = useState(120);
+  const [resetTimeS, setResetTimeS] = useState(30);
   const [streamingEncoding, setStreamingEncoding] = useState(true);
   const [cameras, setCameras] = useState<CameraConfig[]>([]);
   // Set when arriving here to resume a specific already-recorded dataset
@@ -233,6 +234,7 @@ const Landing = () => {
       dataset_repo_id: datasetRepoId,
       single_task: singleTask,
       num_episodes: numEpisodes,
+      timed_sessions: timedSessions,
       episode_time_s: episodeTimeS,
       reset_time_s: resetTimeS,
       fps: 30,
@@ -332,6 +334,8 @@ const Landing = () => {
         setSingleTask={setSingleTask}
         numEpisodes={numEpisodes}
         setNumEpisodes={setNumEpisodes}
+        timedSessions={timedSessions}
+        setTimedSessions={setTimedSessions}
         episodeTimeS={episodeTimeS}
         setEpisodeTimeS={setEpisodeTimeS}
         resetTimeS={resetTimeS}

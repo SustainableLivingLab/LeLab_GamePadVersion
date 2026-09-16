@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 
+from .claw_gamepad_teleop import ClawGamepadTeleop, GamepadClawTeleopConfig
 from .gamepad_teleop import GamepadSO101Teleop, GamepadSO101TeleopConfig
 from .utils.config import setup_calibration_files
 from .utils.devices import safe_disconnect_device
@@ -38,12 +39,24 @@ current_teleop = None
 _state_lock = threading.Lock()
 
 
+class GripperOverrideRequest(BaseModel):
+    # 0-100, matching the gripper's own scale everywhere else in the app
+    # (Motor 6 in the K12 lessons, GRIPPER_MAX_PER_S in gamepad_teleop.py).
+    # None releases the override back to L2/R2 -- see
+    # GamepadSO101Teleop.set_gripper_override().
+    value: float | None = None
+
+
 class TeleoperateRequest(BaseModel):
     input_mode: str = "leader"  # "leader" or "gamepad"
     leader_port: str = ""
     follower_port: str
     leader_config: str = ""
     follower_config: str
+    # Which Robot subclass to build for the follower. "so101_follower" is the full
+    # 6-motor arm (default, unchanged behavior); "claw_follower" is the K12 app's
+    # single claw-servo rig (see lelab/claw_follower.py).
+    robot_type: str = "so101_follower"
 
 
 def get_joint_positions_from_robot(robot) -> dict[str, float]:
@@ -164,17 +177,31 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
             "" if gamepad_mode else request.leader_config, request.follower_config
         )
 
-        # Create robot config
-        robot_config = SO101FollowerConfig(
-            port=request.follower_port,
-            id=follower_config_name,
-        )
-
+        # Create robot config. Dispatched directly on request.robot_type (not via
+        # make_robot_from_config) so the K12-only "claw_follower" type doesn't need
+        # to be registered in vendored lerobot -- see lelab/claw_follower.py.
         logger.info("Initializing robot and teleop device...")
-        robot = SO101Follower(robot_config)
-        teleop_device = GamepadSO101Teleop(GamepadSO101TeleopConfig()) if gamepad_mode else SO101Leader(
-            SO101LeaderConfig(port=request.leader_port, id=leader_config_name)
-        )
+        if request.robot_type == "claw_follower":
+            from .claw_follower import ClawFollower
+            from .config_claw_follower import ClawFollowerConfig
+
+            robot_config = ClawFollowerConfig(port=request.follower_port, id=follower_config_name)
+            robot = ClawFollower(robot_config)
+        else:
+            robot_config = SO101FollowerConfig(
+                port=request.follower_port,
+                id=follower_config_name,
+            )
+            robot = SO101Follower(robot_config)
+
+        if gamepad_mode:
+            teleop_device = (
+                ClawGamepadTeleop(GamepadClawTeleopConfig())
+                if request.robot_type == "claw_follower"
+                else GamepadSO101Teleop(GamepadSO101TeleopConfig())
+            )
+        else:
+            teleop_device = SO101Leader(SO101LeaderConfig(port=request.leader_port, id=leader_config_name))
 
         # Connect the follower first so the error names which device failed
         # instead of a generic "failed to start".
@@ -260,8 +287,27 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                 last_gamepad_debug_log = 0.0
 
                 while teleoperation_active:
-                    action = teleop_device.get_action()
-                    sent = robot.send_action(action)
+                    try:
+                        action = teleop_device.get_action()
+                        sent = robot.send_action(action)
+                    except Exception as e:
+                        # get_action() already protects itself against a
+                        # dropped controller (freezes in place, retries the
+                        # connection -- see GamepadSO101Teleop/ClawGamepadTeleop's
+                        # own try/except). This one is for what THAT can't
+                        # cover: robot.send_action() itself failing -- most
+                        # commonly the serial bus being momentarily busy (a
+                        # concurrent /joint-positions poll racing this same
+                        # thread's own bus access, "[TxRxResult] Port is in
+                        # use!"). Previously that propagated straight out of
+                        # this loop, hitting the except/finally below and
+                        # silently killing the WHOLE session -- disconnecting
+                        # both devices -- over one transient write. Log and
+                        # skip this one tick instead, same idea as the
+                        # joint-broadcast step just below already does.
+                        logger.error(f"Error during teleoperation tick: {e}")
+                        time.sleep(0.001)
+                        continue
 
                     if gamepad_mode:
                         now_dbg = time.time()
@@ -382,7 +428,13 @@ def handle_teleoperation_status() -> dict[str, Any]:
         "message": "Teleoperation status retrieved successfully",
     }
 
-    if teleoperation_active and isinstance(current_teleop, GamepadSO101Teleop):
+    # Both gamepad teleoperators (the 6-motor arm and Lesson 2.2's
+    # single-servo claw) expose the same _joystick/get_teleop_events() shape
+    # -- ClawGamepadTeleop was missing from this check entirely, so Lesson
+    # 2.2's UI could never show "connected, press Cross" / "active", only
+    # ever the same "no gamepad detected" fallback regardless of the real
+    # state.
+    if teleoperation_active and isinstance(current_teleop, (GamepadSO101Teleop, ClawGamepadTeleop)):
         events = current_teleop.get_teleop_events()
         gamepad_name = None
         if events["gamepad_connected"] and current_teleop._joystick is not None:
@@ -400,6 +452,22 @@ def handle_teleoperation_status() -> dict[str, Any]:
         }
 
     return status
+
+
+def handle_set_gripper_override(request: GripperOverrideRequest) -> dict[str, Any]:
+    """Let something other than the gamepad's own triggers drive the gripper
+    (the K12 app's Lesson 4.2 browser-side hand-gesture classifier) while a
+    gamepad teleoperation session is running -- every other joint keeps
+    taking gamepad input as usual. See GamepadSO101Teleop.set_gripper_override().
+    Only meaningful for the full 6-motor arm's teleoperator -- Lesson 2.2's
+    ClawGamepadTeleop has no other joints for L2/R2 to keep driving, so
+    there's nothing for an override to coexist with there.
+    """
+    if not teleoperation_active or not isinstance(current_teleop, GamepadSO101Teleop):
+        return {"success": False, "message": "No active gamepad teleoperation session"}
+
+    current_teleop.set_gripper_override(request.value)
+    return {"success": True}
 
 
 def handle_get_joint_positions() -> dict[str, Any]:

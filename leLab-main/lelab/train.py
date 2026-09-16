@@ -20,6 +20,7 @@ lives in app/jobs.py.
 
 import json
 import re
+import sys
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -133,6 +134,15 @@ def build_training_command(
         cmd.extend(["--dataset.episodes"] + [str(ep) for ep in request.dataset_episodes])
     if request.dataset_image_transforms_enable:
         cmd.extend(["--dataset.image_transforms.enable", "true"])
+    if sys.platform == "win32":
+        # lerobot's get_safe_default_video_backend() picks torchcodec whenever
+        # it *imports* successfully, but on Windows that import can succeed
+        # while the actual native DLL (libtorchcodec_core*.dll, which needs
+        # FFmpeg's shared libs) still fails to load at decode time -- crashing
+        # training with a FileNotFoundError/OSError once it actually reads a
+        # video frame. pyav doesn't have this gap and works reliably on
+        # Windows, so force it there rather than trusting the "safe" default.
+        cmd.extend(["--dataset.video_backend", "pyav"])
 
     # Policy
     cmd.extend(["--policy.type", request.policy_type])

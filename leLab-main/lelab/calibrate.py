@@ -28,10 +28,7 @@ from typing import Any, Literal
 
 from lerobot.motors import MotorCalibration
 from lerobot.motors.feetech import OperatingMode
-from lerobot.robots import (
-    Robot,
-    make_robot_from_config,
-)
+from lerobot.robots import Robot
 from lerobot.teleoperators import (
     Teleoperator,
     make_teleoperator_from_config,
@@ -98,6 +95,10 @@ class CalibrationRequest:
     port: str
     config_file: str
     robot_name: str | None = None  # When set, write port + config back into the robot record on success
+    # Which Robot subclass to build for device_type=="robot". "so101_follower" is the
+    # full 6-motor arm (default, unchanged behavior); "claw_follower" is the K12 app's
+    # single claw-servo rig (see lelab/claw_follower.py). Ignored for device_type=="teleop".
+    robot_type: str = "so101_follower"
 
 
 class CalibrationManager:
@@ -273,25 +274,30 @@ class CalibrationManager:
         try:
             logger.info(f"Starting calibration worker for {request.device_type}")
 
-            # Create device configuration
-            if request.device_type == "robot":
-                from lerobot.robots.so_follower import SO101FollowerConfig
+            self._update_status(status="connecting", message="Connecting to device...")
 
-                config = SO101FollowerConfig(port=request.port, id=request.config_file)
+            # Create and connect device. Robot construction is dispatched directly
+            # (not via make_robot_from_config) so a K12-only robot type like
+            # "claw_follower" doesn't need to be registered in vendored lerobot.
+            if request.device_type == "robot":
+                if request.robot_type == "claw_follower":
+                    from .claw_follower import ClawFollower
+                    from .config_claw_follower import ClawFollowerConfig
+
+                    config = ClawFollowerConfig(port=request.port, id=request.config_file)
+                    self.device = ClawFollower(config)
+                else:
+                    from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+
+                    config = SO101FollowerConfig(port=request.port, id=request.config_file)
+                    self.device = SO101Follower(config)
             elif request.device_type == "teleop":
                 from lerobot.teleoperators.so_leader import SO101LeaderConfig
 
                 config = SO101LeaderConfig(port=request.port, id=request.config_file)
+                self.device = make_teleoperator_from_config(config)
             else:
                 raise ValueError(f"Unknown device type: {request.device_type}")
-
-            self._update_status(status="connecting", message="Connecting to device...")
-
-            # Create and connect device
-            if request.device_type == "robot":
-                self.device = make_robot_from_config(config)
-            else:
-                self.device = make_teleoperator_from_config(config)
 
             logger.info("Connecting to device...")
             self.device.connect(calibrate=False)

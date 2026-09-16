@@ -66,6 +66,9 @@ last_recording_info: dict[str, Any] | None = (
 # both pass the active-flag check.
 _state_lock = threading.Lock()
 
+# Stand-in for "no time limit" -- see create_record_config()'s use of this.
+UNLIMITED_TIME_S = 86400  # 24h
+
 
 class RecordingRequest(BaseModel):
     input_mode: str = "leader"  # "leader" or "gamepad"
@@ -75,9 +78,17 @@ class RecordingRequest(BaseModel):
     follower_config: str
     dataset_repo_id: str
     single_task: str
-    num_episodes: int = 5
-    episode_time_s: int = 30
-    reset_time_s: int = 10
+    num_episodes: int = 30
+    # These two only take effect when timed_sessions=True; see
+    # create_record_config()'s UNLIMITED_TIME_S handling otherwise.
+    episode_time_s: int = 120
+    reset_time_s: int = 30
+    # False (default): episodes/resets have no time limit -- the session
+    # always ends via the user's own End Episode / Start Next Episode
+    # control, same as the original standalone kinesthetic/gamepad recording
+    # scripts this app's recording flow is modeled on. True: episode_time_s /
+    # reset_time_s below are enforced as real countdown limits.
+    timed_sessions: bool = False
     fps: int = 30
     video: bool = True
     push_to_hub: bool = False
@@ -200,8 +211,15 @@ def create_record_config(request: RecordingRequest) -> RecordConfig:
         single_task=request.single_task,
         root=str(HF_LEROBOT_HOME / request.dataset_repo_id) if request.resume else None,
         num_episodes=request.num_episodes,
-        episode_time_s=request.episode_time_s,
-        reset_time_s=request.reset_time_s,
+        # lerobot's record_loop() does `while timestamp < control_time_s`,
+        # which raises TypeError against None despite control_time_s being
+        # typed `int | None` -- so a real "no limit" mode isn't actually
+        # supported upstream. Substitute a 24h ceiling instead when the user
+        # didn't ask for timed sessions; in practice the loop always ends via
+        # the user's own control button long before that, this only exists
+        # to avoid the crash.
+        episode_time_s=request.episode_time_s if request.timed_sessions else UNLIMITED_TIME_S,
+        reset_time_s=request.reset_time_s if request.timed_sessions else UNLIMITED_TIME_S,
         fps=request.fps,
         video=request.video,
         push_to_hub=request.push_to_hub,
@@ -273,7 +291,14 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
                 name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
                 request.dataset_repo_id = f"{namespace}/{name}"
             else:
-                request.dataset_repo_id = re.sub(r"[^A-Za-z0-9._-]", "_", request.dataset_repo_id)
+                # No namespace supplied (e.g. not logged in to Hugging Face) --
+                # fall back to a "local/" namespace rather than leaving this
+                # slash-less, which crashes lerobot's own
+                # sanity_check_dataset_name() downstream (it assumes every
+                # repo_id is "namespace/name"). Matches the "local/..." repo_id
+                # convention already used elsewhere for on-disk-only datasets.
+                name = re.sub(r"[^A-Za-z0-9._-]", "_", request.dataset_repo_id)
+                request.dataset_repo_id = f"local/{name}"
         # Stamp the repo_id with a timestamp (matches lerobot-record CLI behavior),
         # so each session lands in a unique directory and the frontend gets the
         # final id back in the response and status payload.
@@ -499,6 +524,11 @@ def handle_recording_status() -> dict[str, Any]:
         status["current_episode"] = current_episode
         status["total_episodes"] = recording_config.num_episodes
         status["saved_episodes"] = saved_episodes  # Track completed episodes
+        # Drives whether the frontend shows a countdown/progress bar or just
+        # an elapsed-time readout. Deliberately not inferred from
+        # phase_time_limit_s's magnitude (which is UNLIMITED_TIME_S, an
+        # internal workaround, when this is False) -- see create_record_config().
+        status["timed_sessions"] = recording_config.timed_sessions
         # Names of the cameras the user configured for this session. The frontend
         # renders a live /camera-feed/{name} preview for exactly these — nothing
         # else — so only configured cameras are ever shown.

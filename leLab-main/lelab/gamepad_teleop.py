@@ -112,10 +112,20 @@ def get_dpad_delta(js) -> float:
     return dpad_delta
 
 
-def step_targets(js, current_targets: dict[str, float], dt: float) -> dict[str, float]:
+def step_targets(
+    js, current_targets: dict[str, float], dt: float, gripper_override: float | None = None
+) -> dict[str, float]:
     """Advance current_targets by one control-loop tick based on live stick/trigger state.
 
     Mutates and returns current_targets.
+
+    `gripper_override`, when not None, is a 0-100 target set by something other
+    than this controller's own triggers (e.g. the K12 app's Lesson 4.2
+    browser-side hand-gesture classifier, via
+    GamepadSO101Teleop.set_gripper_override()) -- the gripper then ramps
+    toward it at the same max rate L2/R2 would use, instead of reading L2/R2
+    at all, while every other joint keeps taking gamepad input exactly as
+    usual.
     """
     for joint, cfg in JOINT_CONFIG.items():
         raw = apply_deadzone(js.get_axis(cfg["axis"]), cfg.get("deadzone", DEADZONE))
@@ -129,11 +139,19 @@ def step_targets(js, current_targets: dict[str, float], dt: float) -> dict[str, 
         new_val = current_targets["wrist_flex"] + vel * dt
         current_targets["wrist_flex"] = max(JOINT_MIN_DEG, min(JOINT_MAX_DEG, new_val))
 
-    l2 = (js.get_axis(AXIS_L2) + 1.0) / 2.0  # 0 (released) .. 1 (pressed)
-    r2 = (js.get_axis(AXIS_R2) + 1.0) / 2.0
-    gripper_vel = GRIPPER_SIGN * (r2 - l2) * GRIPPER_MAX_PER_S
-    new_gripper = current_targets["gripper"] + gripper_vel * dt
-    current_targets["gripper"] = max(0.0, min(100.0, new_gripper))
+    if gripper_override is not None:
+        current = current_targets["gripper"]
+        max_step = GRIPPER_MAX_PER_S * dt
+        if abs(gripper_override - current) <= max_step:
+            current_targets["gripper"] = gripper_override
+        else:
+            current_targets["gripper"] = current + (max_step if gripper_override > current else -max_step)
+    else:
+        l2 = (js.get_axis(AXIS_L2) + 1.0) / 2.0  # 0 (released) .. 1 (pressed)
+        r2 = (js.get_axis(AXIS_R2) + 1.0) / 2.0
+        gripper_vel = GRIPPER_SIGN * (r2 - l2) * GRIPPER_MAX_PER_S
+        new_gripper = current_targets["gripper"] + gripper_vel * dt
+        current_targets["gripper"] = max(0.0, min(100.0, new_gripper))
 
     return current_targets
 
@@ -196,6 +214,12 @@ class GamepadSO101Teleop(Teleoperator):
         # of retrying a slow Joystick() open every single control tick.
         self._gamepad_connected = True
         self._last_reconnect_attempt = 0.0
+        # External claw command (0-100), set via set_gripper_override() -- see
+        # step_targets(). None means "L2/R2 drive the gripper", the original
+        # behavior; used by the K12 app's Lesson 4.2 hand-gesture claw control
+        # to take over just this one axis while gamepad input keeps driving
+        # every other joint.
+        self._gripper_override: float | None = None
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -255,6 +279,7 @@ class GamepadSO101Teleop(Teleoperator):
         self._targets = dict(present)
         self._home_position = dict(present)
         self._running = False
+        self._gripper_override = None
 
     def _attempt_reconnect(self) -> bool:
         """Try to re-open the joystick after a drop. Rate-limited by
@@ -332,7 +357,7 @@ class GamepadSO101Teleop(Teleoperator):
             self._last_tick = now
 
             if self._running:
-                step_targets(self._joystick, self._targets, dt)
+                step_targets(self._joystick, self._targets, dt, self._gripper_override)
         except Exception as e:
             # The controller went away mid-read (Bluetooth hiccup, dongle out
             # of range, USB unplug). Freeze the arm in place -- force
@@ -346,6 +371,17 @@ class GamepadSO101Teleop(Teleoperator):
             self._home_held = False
 
         return {f"{joint}.pos": val for joint, val in self._targets.items()}
+
+    def set_gripper_override(self, value: float | None) -> None:
+        """Take over the gripper axis with an external 0-100 target (or pass
+        None to release it back to L2/R2). See step_targets() for how this is
+        applied -- ramped at the same max rate trigger input would use, not
+        snapped. Safe to call whether or not teleoperation is currently
+        running; a paused session (Cross not pressed) just holds the override
+        value in place until motion resumes, same as it would hold any other
+        target.
+        """
+        self._gripper_override = None if value is None else max(0.0, min(100.0, value))
 
     def get_teleop_events(self) -> dict[str, Any]:
         """Extra button state the web layer polls independently of get_action()
@@ -380,4 +416,5 @@ class GamepadSO101Teleop(Teleoperator):
             self._pygame = None
         self._targets = None
         self._robot = None
+        self._gripper_override = None
         logger.info("Gamepad disconnected.")

@@ -338,7 +338,7 @@ def get_default_robot_config(robot_type: str, available_configs: list):
 
 # Characters disallowed in a robot name (filesystem safety)
 _INVALID_NAME_CHARS = ("/", "\\", "..")
-_ROBOT_STRING_FIELDS = ("leader_port", "follower_port", "leader_config", "follower_config", "input_mode")
+_ROBOT_STRING_FIELDS = ("leader_port", "follower_port", "leader_config", "follower_config", "input_mode", "robot_type")
 _ROBOT_LIST_FIELDS = ("cameras",)
 
 
@@ -356,9 +356,9 @@ def is_valid_robot_name(name: str) -> bool:
 
 
 def _empty_record(name: str) -> dict:
-    record: dict = {"name": name, "input_mode": "leader"}
+    record: dict = {"name": name, "input_mode": "leader", "robot_type": "so101_follower"}
     for field in _ROBOT_STRING_FIELDS:
-        if field != "input_mode":
+        if field not in ("input_mode", "robot_type"):
             record[field] = ""
     for field in _ROBOT_LIST_FIELDS:
         record[field] = []
@@ -383,6 +383,8 @@ def get_robot_record(name: str) -> dict | None:
     record.update({k: v for k, v in data.items() if k in record})
     if not record.get("input_mode"):
         record["input_mode"] = "leader"
+    if not record.get("robot_type"):
+        record["robot_type"] = "so101_follower"
     record["name"] = name
     return record
 
@@ -463,7 +465,7 @@ def is_robot_record_clean(record: dict) -> bool:
     gamepad_mode = record.get("input_mode") == "gamepad"
     required_fields = ("follower_port", "follower_config") if gamepad_mode else _ROBOT_STRING_FIELDS
     for field in required_fields:
-        if field == "input_mode":
+        if field in ("input_mode", "robot_type"):
             continue
         value = record.get(field, "")
         if not isinstance(value, str) or not value.strip():

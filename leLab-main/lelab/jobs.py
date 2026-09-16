@@ -122,10 +122,18 @@ class MetricsHistoryPoint(BaseModel):
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return True if a process with this PID exists. Cheap; uses signal 0."""
+    """Return True if a process with this PID exists. Cheap; uses signal 0.
+
+    Best-effort: on Windows, os.kill(pid, 0) against a PID that no longer
+    exists (or was recycled to something we can't signal) has been observed
+    to raise SystemError rather than the documented OSError subclasses --
+    which would otherwise crash server startup entirely while loading a
+    stale job record. Treat any failure here as "can't confirm it's alive",
+    so a weird PID can never block the whole app from starting.
+    """
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
+    except Exception:
         return False
     return True
 
@@ -238,7 +246,12 @@ class SubprocessJobRunner:
         write; _consume_lines closes it when its iterator is exhausted."""
         if self._log_file_path is not None:
             self._log_file_path.parent.mkdir(parents=True, exist_ok=True)
-            self._log_file = self._log_file_path.open("a", buffering=1)
+            # Explicit UTF-8: same reasoning as the subprocess decode above --
+            # without it this defaults to the Windows system locale (cp1252),
+            # which can't represent every character a training subprocess's
+            # output might legitimately contain (e.g. tqdm's Unicode
+            # block-drawing characters).
+            self._log_file = self._log_file_path.open("a", buffering=1, encoding="utf-8")
 
     def _spawn(self, cmd: list[str], thread_name: str) -> None:
         """Open the log sink, launch `cmd`, and start the stdout pump thread."""
@@ -262,6 +275,18 @@ class SubprocessJobRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True,
+            # Without an explicit encoding, Windows decodes the child's stdout
+            # bytes using the system locale (cp1252 here), not UTF-8. tqdm's
+            # progress bar uses Unicode block-drawing characters once it has
+            # rendered enough resolution to need a partial-fill glyph, which
+            # aren't valid cp1252 -- decoding then raises UnicodeDecodeError,
+            # silently killing this thread's readline() loop with nothing left
+            # to drain the pipe. The child then eventually blocks trying to
+            # write further output once the OS pipe buffer fills, which looks
+            # exactly like training itself hanging. errors="replace" is a
+            # second line of defense against any other undecodable byte.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             env=child_env,
             start_new_session=True,

@@ -47,6 +47,7 @@ interface RecordingConfig {
   dataset_repo_id: string;
   single_task: string;
   num_episodes: number;
+  timed_sessions: boolean;
   episode_time_s: number;
   reset_time_s: number;
   fps: number;
@@ -66,6 +67,11 @@ interface BackendStatus {
   saved_episodes?: number;
   phase_elapsed_seconds?: number;
   phase_time_limit_s?: number;
+  // False when the session has no time limit (episodes/resets end only via
+  // the user's own control button) -- phase_time_limit_s is still a real
+  // number in that case (an internal workaround, not a real countdown), so
+  // this flag is what actually decides whether to render a countdown/bar.
+  timed_sessions?: boolean;
   session_elapsed_seconds?: number;
   session_ended?: boolean;
   dataset_repo_id?: string;
@@ -229,7 +235,10 @@ const Recording = () => {
 
         const elapsed = status.phase_elapsed_seconds || 0;
         const limit = status.phase_time_limit_s || 0;
-        const inFinalThreeSeconds = limit > 3 && elapsed >= limit - 3;
+        // Untimed sessions have no real countdown to warn about -- don't rely
+        // on the internal "unlimited" sentinel being large enough on its own.
+        const inFinalThreeSeconds =
+          status.timed_sessions !== false && limit > 3 && elapsed >= limit - 3;
         const ep = status.current_episode ?? null;
         const tick = rerecordTickRef.current;
         const warned = warningFiredForPhaseRef.current;
@@ -509,6 +518,8 @@ const Recording = () => {
       : currentPhase === "resetting"
       ? recordingConfig.reset_time_s
       : backendStatus.phase_time_limit_s || 0;
+  // Defaults to timed for older sessions/objects that predate this field.
+  const isTimed = recordingConfig.timed_sessions !== false;
 
   const sessionElapsedTime = backendStatus.session_elapsed_seconds || 0;
 
@@ -647,19 +658,27 @@ const Recording = () => {
             <div className={`text-7xl font-mono font-bold leading-none ${phaseColor.timer}`}>
               {formatTime(phaseElapsedTime)}
             </div>
-            <div className="text-sm text-gray-500 mt-2">
-              / {formatTime(phaseTimeLimit)}
-            </div>
+            {isTimed ? (
+              <div className="text-sm text-gray-500 mt-2">
+                / {formatTime(phaseTimeLimit)}
+              </div>
+            ) : (
+              <div className="text-sm text-gray-500 mt-2">
+                no limit — end it yourself when ready
+              </div>
+            )}
           </div>
 
-          <div className="w-full bg-gray-800 rounded-full h-1.5 mb-4 flex-shrink-0">
-            <div
-              className={`h-1.5 rounded-full transition-all duration-500 ${phaseColor.bar}`}
-              style={{
-                width: `${Math.min((phaseElapsedTime / phaseTimeLimit) * 100, 100)}%`,
-              }}
-            />
-          </div>
+          {isTimed && (
+            <div className="w-full bg-gray-800 rounded-full h-1.5 mb-4 flex-shrink-0">
+              <div
+                className={`h-1.5 rounded-full transition-all duration-500 ${phaseColor.bar}`}
+                style={{
+                  width: `${Math.min((phaseElapsedTime / phaseTimeLimit) * 100, 100)}%`,
+                }}
+              />
+            </div>
+          )}
 
           <Button
             onClick={handleExitEarly}

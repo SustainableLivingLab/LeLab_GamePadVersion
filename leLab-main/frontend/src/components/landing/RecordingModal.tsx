@@ -34,6 +34,8 @@ interface RecordingModalProps {
   setSingleTask: (value: string) => void;
   numEpisodes: number;
   setNumEpisodes: (value: number) => void;
+  timedSessions: boolean;
+  setTimedSessions: (value: boolean) => void;
   episodeTimeS: number;
   setEpisodeTimeS: (value: number) => void;
   resetTimeS: number;
@@ -60,6 +62,8 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
   setSingleTask,
   numEpisodes,
   setNumEpisodes,
+  timedSessions,
+  setTimedSessions,
   episodeTimeS,
   setEpisodeTimeS,
   resetTimeS,
@@ -212,11 +216,34 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                     className="bg-gray-800 border-gray-700 text-white"
                   />
                 </div>
+                <div className="flex items-start gap-3">
+                  <Checkbox
+                    id="timedSessions"
+                    checked={timedSessions}
+                    onCheckedChange={(value) =>
+                      setTimedSessions(value === true)
+                    }
+                    className="mt-0.5 border-gray-500 data-[state=checked]:bg-red-500 data-[state=checked]:border-red-500"
+                  />
+                  <div className="space-y-1">
+                    <Label
+                      htmlFor="timedSessions"
+                      className="text-sm font-medium text-gray-200 cursor-pointer"
+                    >
+                      Make sessions timed
+                    </Label>
+                    <p className="text-xs text-gray-500">
+                      Off by default: episodes and resets run until you end
+                      them yourself, no limit. Turn on to enforce a fixed
+                      duration for each instead.
+                    </p>
+                  </div>
+                </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label
                       htmlFor="episodeTimeS"
-                      className="text-sm font-medium text-gray-300"
+                      className={`text-sm font-medium ${timedSessions ? "text-gray-300" : "text-gray-500"}`}
                     >
                       Episode duration (seconds)
                     </Label>
@@ -227,13 +254,14 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                       onChange={(v) => {
                         if (v !== undefined) setEpisodeTimeS(v);
                       }}
+                      disabled={!timedSessions}
                       className="bg-gray-800 border-gray-700 text-white"
                     />
                   </div>
                   <div className="space-y-2">
                     <Label
                       htmlFor="resetTimeS"
-                      className="text-sm font-medium text-gray-300"
+                      className={`text-sm font-medium ${timedSessions ? "text-gray-300" : "text-gray-500"}`}
                     >
                       Reset duration (seconds)
                     </Label>
@@ -244,6 +272,7 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                       onChange={(v) => {
                         if (v !== undefined) setResetTimeS(v);
                       }}
+                      disabled={!timedSessions}
                       className="bg-gray-800 border-gray-700 text-white"
                     />
                   </div>

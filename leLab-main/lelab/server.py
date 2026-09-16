@@ -72,8 +72,10 @@ from .rollout import (
 
 # Import our custom teleoperation functionality
 from .teleoperate import (
+    GripperOverrideRequest,
     TeleoperateRequest,
     handle_get_joint_positions,
+    handle_set_gripper_override,
     handle_start_teleoperation,
     handle_stop_teleoperation,
     handle_teleoperation_status,
@@ -325,6 +327,15 @@ def teleoperation_status():
 def get_joint_positions():
     """Get current robot joint positions"""
     return handle_get_joint_positions()
+
+
+@app.post("/gripper-override")
+def gripper_override(request: GripperOverrideRequest):
+    """Let something other than the gamepad's own triggers drive the gripper
+    (Lesson 4.2's browser-side hand-gesture claw control) during an active
+    gamepad teleoperation session. Pass value: null to release it back to
+    L2/R2."""
+    return handle_set_gripper_override(request)
 
 
 @app.get("/gamepad-status")

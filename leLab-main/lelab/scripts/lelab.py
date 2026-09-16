@@ -23,6 +23,7 @@ bundle from the same process. Dev mode starts Vite on :8080 and uvicorn
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import logging
 import os
@@ -40,6 +41,29 @@ from typing import NoReturn
 
 import psutil
 import uvicorn
+
+# Several modules print emoji status messages (recording/reset/save progress,
+# etc.). Windows' console defaults to a legacy codepage (e.g. cp1252) that
+# can't encode them, which crashes those print() calls with a
+# UnicodeEncodeError -- including on normal, successful recording runs, not
+# just error paths. Force UTF-8 for this process, and set it in the
+# environment too so subprocesses (e.g. --dev mode's uvicorn --reload
+# supervisor) inherit it as well.
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+for _stream in (sys.stdout, sys.stderr):
+    if getattr(_stream, "encoding", "").lower() != "utf-8" and hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
+# asyncio's default ProactorEventLoop on Windows has long-standing reliability
+# issues with subprocess pipe transports under sustained I/O (the training/
+# recording subprocesses we pipe stdout from) -- symptoms range from a logged
+# "_ProactorBaseWritePipeTransport._loop_writing" exception to a subprocess's
+# output silently stopping partway through with no error at all, even though
+# the subprocess itself is still alive and running fine. SelectorEventLoop
+# doesn't share this subprocess-transport code path and is the standard
+# workaround. Must be set before uvicorn (or anything else) creates the loop.
+if os.name == "nt":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
