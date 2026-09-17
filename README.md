@@ -35,6 +35,14 @@ Open PowerShell and paste:
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install --python 3.13 "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git#subdirectory=leLab-main" --reinstall; lelab-gamepad
 ```
 
+`--reinstall` makes `uv` fetch and install the current code fresh every time you run this command,
+instead of reusing whatever was already installed. Use this exact command (with `--reinstall`)
+whenever you're installing for the first time, or want to pick up the latest fixes and features
+later; it's harmless to run repeatedly. It's the only part of this command you'd ever drop: once
+you're on a version you're happy with and just want to launch the app day-to-day, use the shorter
+`lelab-gamepad` command by itself instead (see "To run it again later" below), which skips the
+install step entirely and starts instantly.
+
 `--python 3.13` tells `uv` which Python to run the app on; it downloads and manages that version
 itself if you don't already have it, completely separately from any other Python already on your
 machine. This is required, not optional: one of this app's dependencies (`pygame`, used for
@@ -63,8 +71,7 @@ follower arm, then open PowerShell and run:
 lelab-gamepad
 ```
 
-**To update to the latest version** later, run the same one-liner again: `--reinstall` makes it
-fetch and install the current code fresh, even if you already have a version installed.
+**To update to the latest version** later, run the Quick Start one-liner above again.
 
 If this fails for any reason, or you want to see/edit the actual source code, follow the manual
 setup below instead: it's the same install, just done step by step so you can see what's
