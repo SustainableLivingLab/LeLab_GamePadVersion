@@ -320,17 +320,18 @@ const AdvancedCard: React.FC<ConfigComponentProps> = ({ config, updateConfig }) 
           {/* Misc */}
           <section className="space-y-4">
             <SectionHeading>Misc</SectionHeading>
-            <div className="flex items-center space-x-3">
-              <Switch
-                id="use_policy_training_preset"
-                checked={config.use_policy_training_preset}
-                onCheckedChange={(checked) =>
-                  updateConfig('use_policy_training_preset', checked)
-                }
-              />
-              <Label htmlFor="use_policy_training_preset" className="text-slate-300">
-                Use Policy Training Preset
-              </Label>
+            <div className="space-y-1">
+              <div className="flex items-center space-x-3">
+                <Switch id="use_policy_training_preset" checked={true} disabled />
+                <Label htmlFor="use_policy_training_preset" className="text-slate-500">
+                  Use Policy Training Preset
+                </Label>
+              </div>
+              <p className="text-xs text-slate-500 pl-[52px]">
+                Always on: turning this off requires a full optimizer and
+                scheduler configuration that isn't available here yet, and
+                always fails training immediately otherwise.
+              </p>
             </div>
           </section>
         </CardContent>
