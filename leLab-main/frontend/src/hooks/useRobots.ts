@@ -43,6 +43,12 @@ export const useRobots = () => {
   const [records, setRecords] = useState<Record<string, RobotRecord>>({});
   const [selectedName, setSelectedName] = useState<string | null>(() => readSelected());
   const [isLoading, setIsLoading] = useState(false);
+  // Distinct from isLoading, which starts false and would otherwise look
+  // identical to "already loaded" on the very first render, before the
+  // fetch-on-mount effect below has even started. Consumers that need to
+  // wait for the initial fetch (e.g. before reading selectedRecord) should
+  // gate on this instead.
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
 
   // Re-fetch records when location changes (RobotConfigManager mounts only on Landing,
   // so this fires on initial mount and on back-navigation to Landing)
@@ -64,7 +70,10 @@ export const useRobots = () => {
           console.error("Failed to fetch robots:", e);
         }
       } finally {
-        if (!cancelled) setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+          setHasLoadedOnce(true);
+        }
       }
     };
     fetchAll();
@@ -197,6 +206,7 @@ export const useRobots = () => {
     selectedRecord,
     availableNames,
     isLoading,
+    hasLoadedOnce,
     selectRobot,
     clearSelection,
     createRobot,

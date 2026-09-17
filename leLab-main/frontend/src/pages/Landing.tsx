@@ -29,6 +29,7 @@ const Landing = () => {
     selectedRecord,
     availableNames,
     isLoading: isLoadingRobots,
+    hasLoadedOnce: hasLoadedRobotsOnce,
     selectRobot,
     createRobot,
     deleteRobot,
@@ -65,7 +66,15 @@ const Landing = () => {
 
   // Open the recording modal pre-filled to resume a dataset, if we arrived
   // here via navigate("/", { state: { resumeDatasetRepoId } }).
+  //
+  // Waits for useRobots()'s initial fetch to finish first (hasLoadedRobotsOnce,
+  // not isLoading -- isLoading starts false too, so it can't distinguish
+  // "haven't started fetching yet" from "done fetching", and this effect can
+  // otherwise fire on the very first render after a fresh navigation to "/",
+  // before that fetch resolves, when selectedRecord is still null. That's
+  // what silently produced an empty Cameras section in Continue Recording.
   useEffect(() => {
+    if (!hasLoadedRobotsOnce) return;
     const repoId = (location.state as { resumeDatasetRepoId?: string } | null)
       ?.resumeDatasetRepoId;
     if (!repoId) return;
@@ -76,7 +85,7 @@ const Landing = () => {
     // refresh) doesn't re-open the modal.
     navigate(".", { replace: true, state: null });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.state, navigate]);
+  }, [location.state, navigate, hasLoadedRobotsOnce]);
 
   // Clear camera state and release streams when returning to landing page
   useEffect(() => {
