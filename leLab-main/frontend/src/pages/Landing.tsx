@@ -58,6 +58,11 @@ const Landing = () => {
   const location = useLocation();
   const { toast } = useToast();
 
+  const openRecordingModal = () => {
+    setCameras(selectedRecord ? [...(selectedRecord.cameras ?? [])] : []);
+    setShowRecordingModal(true);
+  };
+
   // Open the recording modal pre-filled to resume a dataset, if we arrived
   // here via navigate("/", { state: { resumeDatasetRepoId } }).
   useEffect(() => {
@@ -66,10 +71,11 @@ const Landing = () => {
     if (!repoId) return;
     setResumeRepoId(repoId);
     setDatasetName(repoId);
-    setShowRecordingModal(true);
+    openRecordingModal();
     // Clear the navigation state so a later plain visit to "/" (back button,
     // refresh) doesn't re-open the modal.
     navigate(".", { replace: true, state: null });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.state, navigate]);
 
   // Clear camera state and release streams when returning to landing page
@@ -93,11 +99,6 @@ const Landing = () => {
       }
     };
   }, []);
-
-  const openRecordingModal = () => {
-    setCameras(selectedRecord ? [...(selectedRecord.cameras ?? [])] : []);
-    setShowRecordingModal(true);
-  };
 
   const handleRecordingModalClose = (open: boolean) => {
     setShowRecordingModal(open);
