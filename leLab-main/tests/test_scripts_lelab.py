@@ -134,7 +134,7 @@ def test_ensure_port_available_exits_with_actionable_message(
         launcher._ensure_port_available("Backend", 8000)
 
     assert "Backend port 8000 is already in use" in caplog.text
-    assert "lelab --stop" in caplog.text
+    assert "lelab-gamepad --stop" in caplog.text
 
 
 def test_frontend_install_is_skipped_when_node_modules_exists(
@@ -411,7 +411,7 @@ def test_missing_frontend_dist_reports_rebuild_hint(
         launcher._ensure_frontend_dist()
 
     assert "Built frontend not found" in caplog.text
-    assert "Run `lelab --rebuild`" in caplog.text
+    assert "Run `lelab-gamepad --rebuild`" in caplog.text
 
 
 def test_dev_launcher_reports_frontend_exit_before_ready(

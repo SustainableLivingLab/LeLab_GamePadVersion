@@ -89,7 +89,7 @@ def get_installed_source() -> dict[str, str] | None:
     compare against).
     """
     try:
-        dist = distribution("lelab")
+        dist = distribution("lelab-gamepad")
     except PackageNotFoundError:
         return None
     raw = dist.read_text("direct_url.json")

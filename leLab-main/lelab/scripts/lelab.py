@@ -77,7 +77,7 @@ def _ensure_port_available(name: str, port: int, host: str = HOST) -> None:
         return
     _fail(
         f"{name} port {port} is already in use on {host}. "
-        "If a previous LeLab run is still holding it, run `lelab --stop` to free it, "
+        "If a previous LeLab run is still holding it, run `lelab-gamepad --stop` to free it, "
         "then run the command again."
     )
 
@@ -173,7 +173,7 @@ def _ensure_frontend_dist() -> None:
     if index_html.exists():
         return
     _fail(
-        f"Built frontend not found at {index_html}. Run `lelab --rebuild`, "
+        f"Built frontend not found at {index_html}. Run `lelab-gamepad --rebuild`, "
         "or run `cd frontend && npm run build`, then start LeLab again."
     )
 
@@ -442,7 +442,7 @@ def _run_dev(*, no_open: bool = False) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="lelab", description="Run LeLab")
+    parser = argparse.ArgumentParser(prog="lelab-gamepad", description="Run LeLab GamePad Version")
     parser.add_argument(
         "--dev",
         action="store_true",

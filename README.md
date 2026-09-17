@@ -32,24 +32,28 @@ machine already has.
 Open PowerShell and paste:
 
 ```powershell
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git#subdirectory=leLab-main" --torch-backend auto --reinstall; lelab
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git#subdirectory=leLab-main" --reinstall; lelab-gamepad
 ```
 
-`--torch-backend auto` picks the right PyTorch build for your machine automatically: a CUDA build
-if you have an NVIDIA GPU and driver, otherwise a CPU-only build. You don't need to know which one
-you're getting; either way, calibration, gamepad teleoperation, and recording all work the same.
-A GPU only matters for local policy rollout speed (training itself runs on Hugging Face's cloud,
-not your machine).
+This installs a plain CPU build of PyTorch by default, the same way the original LeLab's own
+one-liner does. That's all calibration, gamepad teleoperation, and recording ever need locally;
+training itself runs on Hugging Face's cloud, not your machine. If you want a CUDA build for
+faster local policy rollout, install it yourself afterward with `pip install torch --index-url
+https://download.pytorch.org/whl/cu124` (match the CUDA version to your GPU driver) from inside
+the tool's environment, or follow the manual setup below.
+
+This is a separate command from upstream LeLab's own `lelab`, so it installs and runs side by
+side without needing to uninstall anything.
 
 Your browser should open automatically to `http://localhost:8000`. The first run downloads
-everything the app needs (a few hundred MB on CPU, more with a GPU build), so expect it to take a
-few minutes; every run after that starts in seconds.
+everything the app needs (a few hundred MB), so expect it to take a few minutes; every run after
+that starts in seconds.
 
 **To run it again later** (no need to repeat the install), plug in your gamepad and the SO-101
 follower arm, then open PowerShell and run:
 
 ```powershell
-lelab
+lelab-gamepad
 ```
 
 **To update to the latest version** later, run the same one-liner again: `--reinstall` makes it
@@ -154,20 +158,20 @@ lines (deprecation notices, script-not-on-PATH notices) are harmless and expecte
 ### Step 3: Confirm the install
 
 ```powershell
-lelab --help
+lelab-gamepad --help
 ```
 
 You should see a short usage message (`--dev`, `--rebuild`, `--no-open`, `--stop`). If instead
-you get `'lelab' is not recognized`, the install succeeded but the `lelab` command isn't on your
-PATH: either close and reopen your terminal (this fixes it 90% of the time on Windows), or run
-it as `python -m lelab.scripts.lelab --help` instead everywhere in this guide.
+you get `'lelab-gamepad' is not recognized`, the install succeeded but the `lelab-gamepad` command
+isn't on your PATH: either close and reopen your terminal (this fixes it 90% of the time on
+Windows), or run it as `python -m lelab.scripts.lelab --help` instead everywhere in this guide.
 
 ### Step 4: Run it
 
 For everyday use (this is what you want almost every time):
 
 ```powershell
-lelab
+lelab-gamepad
 ```
 
 This starts the server, and **your browser should open automatically** to the app at
@@ -177,7 +181,7 @@ To stop it: go back to the terminal window and press `Ctrl+C`. If it ever gets s
 to force-stop a previous run:
 
 ```powershell
-lelab --stop
+lelab-gamepad --stop
 ```
 
 ### Developer / hot-reload mode
@@ -185,7 +189,7 @@ lelab --stop
 If you're going to edit the code and want changes to show up live without restarting:
 
 ```powershell
-lelab --dev
+lelab-gamepad --dev
 ```
 
 This runs two servers together: a Vite frontend on `:8080` (hot-reloads on file save) and the
@@ -293,16 +297,16 @@ numbers for an unfamiliar controller. `JOINT_CONFIG` holds each joint's axis ind
 - On Windows, check Device Manager → Ports (COM & LPT) to confirm which port the arm's USB-serial
   chip is on.
 
-### `lelab` opens but the page is blank / errors in the browser console
+### `lelab-gamepad` opens but the page is blank / errors in the browser console
 
 - Hard-refresh the page (`Ctrl+Shift+R`).
-- If you were previously running `lelab --dev` and switched to plain `lelab` (or vice versa), run
-  `lelab --stop` first, then start again cleanly.
+- If you were previously running `lelab-gamepad --dev` and switched to plain `lelab-gamepad` (or
+  vice versa), run `lelab-gamepad --stop` first, then start again cleanly.
 
 ### Port 8000 or 8080 already in use
 
 ```powershell
-lelab --stop
+lelab-gamepad --stop
 ```
 
 then start again. This frees both ports if a previous run didn't shut down cleanly.

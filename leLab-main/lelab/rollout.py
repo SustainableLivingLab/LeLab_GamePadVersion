@@ -258,7 +258,7 @@ def _friendly_hint(error_text: str | None) -> str | None:
     if "failed to set capture_" in low or "actual_width" in low or "actual_height" in low:
         return "A camera doesn't support the configured resolution — open camera settings and click Auto."
     if "permission" in low and ("port" in low or "com" in low):
-        return "Couldn't open the serial port — close anything else using it, or run `lelab --stop`."
+        return "Couldn't open the serial port, close anything else using it, or run `lelab-gamepad --stop`."
     if "relative-action" in low or "relative chunk actions" in low:
         return (
             "This policy was trained with relative actions and needs RTC (chunked) inference. "

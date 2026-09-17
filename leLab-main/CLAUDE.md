@@ -21,13 +21,15 @@ pip install -e .
 Run servers (entry point defined in [pyproject.toml](pyproject.toml)):
 
 ```bash
-lelab          # uvicorn on :8000, serves built frontend at /, opens browser
-lelab --dev    # spawns Vite dev (:8080) + uvicorn --reload (:8000), opens browser to :8080
+lelab-gamepad          # uvicorn on :8000, serves built frontend at /, opens browser
+lelab-gamepad --dev    # spawns Vite dev (:8080) + uvicorn --reload (:8000), opens browser to :8080
 ```
 
-When `frontend/**` (excluding `frontend/dist/**`) changes on `main`, [`.github/workflows/build_frontend.yml`](.github/workflows/build_frontend.yml) auto-rebuilds `frontend/dist/` and commits it back. You can still build locally before committing if you want to test the production bundle, but it's no longer required. `lelab --dev` serves directly from Vite, no rebuild needed.
+The console script is named `lelab-gamepad`, not `lelab`, so this fork can be installed and run side by side with upstream LeLab (same package name otherwise, `LeLab`, would collide with it on PATH). See [pyproject.toml](pyproject.toml)'s `[project.scripts]`.
 
-Run the Python tests with `pytest` (config in [pyproject.toml](pyproject.toml); install dev deps via `pip install -e ".[test]"`). Tests live in [tests/](tests/) and cover request schemas, pure helpers, and idle/mutex branches of the feature handlers — subprocess/thread happy paths and HF Jobs integration are deliberately not unit-tested. Lint with `ruff check` / `ruff format` (config in [pyproject.toml](pyproject.toml)). There is no Python build step; for end-to-end validation, run `lelab` and exercise endpoints (curl or via the frontend).
+When `frontend/**` (excluding `frontend/dist/**`) changes on `main`, [`.github/workflows/build_frontend.yml`](.github/workflows/build_frontend.yml) auto-rebuilds `frontend/dist/` and commits it back. You can still build locally before committing if you want to test the production bundle, but it's no longer required. `lelab-gamepad --dev` serves directly from Vite, no rebuild needed.
+
+Run the Python tests with `pytest` (config in [pyproject.toml](pyproject.toml); install dev deps via `pip install -e ".[test]"`). Tests live in [tests/](tests/) and cover request schemas, pure helpers, and idle/mutex branches of the feature handlers — subprocess/thread happy paths and HF Jobs integration are deliberately not unit-tested. Lint with `ruff check` / `ruff format` (config in [pyproject.toml](pyproject.toml)). There is no Python build step; for end-to-end validation, run `lelab-gamepad` and exercise endpoints (curl or via the frontend).
 
 ## Architecture
 
