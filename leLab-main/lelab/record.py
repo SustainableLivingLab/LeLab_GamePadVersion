@@ -242,6 +242,15 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
 
     from . import rollout as _rollout, teleoperate as _teleoperate
 
+    if not request.resume and "/" not in (request.dataset_repo_id or ""):
+        return {
+            "success": False,
+            "message": (
+                "Dataset name is missing a namespace (expected 'username/dataset_name'). "
+                "Log into Hugging Face in the app before recording."
+            ),
+        }
+
     # Claim the active flag under the lock so two concurrent starts can't both
     # pass the precondition check.
     with _state_lock:

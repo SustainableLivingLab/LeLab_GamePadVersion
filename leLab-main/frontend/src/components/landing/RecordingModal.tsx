@@ -74,7 +74,8 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
 }) => {
   const { auth } = useHfAuth();
 
-  const canStart = !!robot && robot.is_clean;
+  const canStart =
+    !!robot && robot.is_clean && (!!resumeRepoId || auth.status === "authenticated");
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -97,6 +98,15 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
           </DialogDescription>
 
           <div className="grid grid-cols-1 gap-6">
+            {!resumeRepoId && auth.status === "unauthenticated" && (
+              <Alert className="bg-amber-900/40 border-amber-700 text-amber-100">
+                <AlertTriangle className="h-4 w-4" />
+                <AlertDescription>
+                  Log into Hugging Face before recording: the dataset needs
+                  your username as its owner.
+                </AlertDescription>
+              </Alert>
+            )}
             <div className="space-y-4">
               <h3 className="text-lg font-semibold text-white border-b border-gray-700 pb-2">
                 Robot Configuration
@@ -173,7 +183,8 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                           </p>
                         ) : auth.status === "unauthenticated" ? (
                           <p className="text-xs text-amber-400/80">
-                            Log in to Hugging Face to set the repository owner.
+                            Log in to Hugging Face to set the repository owner:
+                            recording is disabled until then.
                           </p>
                         ) : null)}
                     </>

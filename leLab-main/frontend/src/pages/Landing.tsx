@@ -172,14 +172,21 @@ const Landing = () => {
       });
       return;
     }
+    if (!resumeRepoId && auth.status !== "authenticated") {
+      toast({
+        title: "Hugging Face login required",
+        description:
+          "Log into Hugging Face before recording: the dataset name needs your username as a prefix.",
+        variant: "destructive",
+      });
+      return;
+    }
 
-    // When resuming, datasetName already holds the exact existing repo_id --
+    // When resuming, datasetName already holds the exact existing repo_id,
     // don't re-namespace it into a new one.
     const datasetRepoId = resumeRepoId
       ? datasetName
-      : auth.status === "authenticated"
-        ? `${auth.username}/${datasetName}`
-        : datasetName;
+      : `${auth.username}/${datasetName}`;
 
     if (cameras.length > 0 && releaseStreamsRef.current) {
       console.log("🔓 Releasing camera streams before starting recording...");
