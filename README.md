@@ -273,6 +273,15 @@ numbers for an unfamiliar controller. `JOINT_CONFIG` holds each joint's axis ind
 
 ## Troubleshooting
 
+### "Application Control policy has blocked this file" when `lelab-gamepad` tries to launch
+
+Windows Smart App Control (or a similar endpoint policy on a work machine) blocks freshly-built,
+unsigned executables by default. `lelab-gamepad.exe` is a console-script shim `uv` builds on your
+own machine during install, same as upstream LeLab's own `lelab.exe`, so this can happen with
+either. To fix it: open **Settings → Privacy & security → Windows Security → App & browser
+control → Smart App Control**, turn it off, then run `lelab-gamepad` again. On a company-managed
+machine, you may need your IT admin to allow it instead.
+
 ### Gamepad not detected
 
 - Make sure the controller is connected **at the operating-system level first**: Python only
