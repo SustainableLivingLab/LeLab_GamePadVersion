@@ -72,7 +72,7 @@ def _atomic_write_text(path: str, content: str) -> None:
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     tmp = f"{path}.tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
     os.replace(tmp, path)
 

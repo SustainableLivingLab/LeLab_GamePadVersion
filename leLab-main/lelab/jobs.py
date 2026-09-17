@@ -238,7 +238,7 @@ class SubprocessJobRunner:
         write; _consume_lines closes it when its iterator is exhausted."""
         if self._log_file_path is not None:
             self._log_file_path.parent.mkdir(parents=True, exist_ok=True)
-            self._log_file = self._log_file_path.open("a", buffering=1)
+            self._log_file = self._log_file_path.open("a", buffering=1, encoding="utf-8")
 
     def _spawn(self, cmd: list[str], thread_name: str) -> None:
         """Open the log sink, launch `cmd`, and start the stdout pump thread."""
@@ -461,7 +461,7 @@ class TailingJobRunner:
                         return
                     self._stop_event.wait(0.5)
                     continue
-                with self._log_file_path.open() as f:
+                with self._log_file_path.open(encoding="utf-8") as f:
                     f.seek(self._tail_offset)
                     while not self._stop_event.is_set():
                         raw = f.readline()
@@ -596,7 +596,7 @@ def _read_checkpoint_config(ckpt: JobCheckpoint) -> dict[str, object]:
                  model repo); both resolve via hf_hub_download.
     """
     if ckpt.source == "local":
-        with open(Path(ckpt.ref) / "config.json") as f:
+        with open(Path(ckpt.ref) / "config.json", encoding="utf-8") as f:
             return json.load(f)
     from huggingface_hub import hf_hub_download
 
@@ -739,13 +739,13 @@ class JobRegistry:
         if not meta.is_file():
             return
         try:
-            data = json.loads(meta.read_text())
+            data = json.loads(meta.read_text(encoding="utf-8"))
         except Exception as exc:
             logger.warning("Migration: could not parse %s: %s", meta, exc)
             return
         data["output_dir"] = str(job_dir / "run")
         tmp = meta.with_suffix(meta.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(tmp, meta)
 
     def set_on_change(self, callback: Callable[[], None] | None) -> None:
@@ -1115,7 +1115,7 @@ class JobRegistry:
             if not meta.exists():
                 continue
             try:
-                data = json.loads(meta.read_text())
+                data = json.loads(meta.read_text(encoding="utf-8"))
                 record = JobRecord.model_validate(data)
             except Exception as exc:
                 logger.warning("Skipping malformed job.json at %s: %s", meta, exc)
@@ -1272,7 +1272,7 @@ class JobRegistry:
         # Atomic write so a crash mid-write never strands a half-written file
         # that would skip the job on next _load_from_disk.
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(record.model_dump_json(indent=2))
+        tmp.write_text(record.model_dump_json(indent=2), encoding="utf-8")
         os.replace(tmp, path)
 
 

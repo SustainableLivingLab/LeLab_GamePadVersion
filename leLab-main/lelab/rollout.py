@@ -352,7 +352,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         log_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / "inference_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{int(time.time())}.log"
-        log_handle = log_path.open("w", buffering=1)
+        log_handle = log_path.open("w", buffering=1, encoding="utf-8")
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
