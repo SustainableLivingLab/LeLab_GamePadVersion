@@ -79,7 +79,9 @@ function configToRequest(c: TrainingConfig): TrainingRequest {
     log_freq: c.log_freq,
     save_freq: c.save_freq,
     save_checkpoint: c.save_checkpoint,
-    resume: c.resume,
+    // Resume from Checkpoint is disabled in the UI (no way to pick a
+    // checkpoint yet), so this is always false regardless of stored state.
+    resume: false,
     wandb_enable: c.wandb_enable,
     wandb_project: c.wandb_project,
     wandb_entity: c.wandb_entity,

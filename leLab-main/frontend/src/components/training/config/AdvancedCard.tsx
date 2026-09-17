@@ -233,15 +233,18 @@ const AdvancedCard: React.FC<ConfigComponentProps> = ({ config, updateConfig }) 
                 Save Checkpoints
               </Label>
             </div>
-            <div className="flex items-center space-x-3">
-              <Switch
-                id="resume"
-                checked={config.resume}
-                onCheckedChange={(checked) => updateConfig('resume', checked)}
-              />
-              <Label htmlFor="resume" className="text-slate-300">
-                Resume from Checkpoint
-              </Label>
+            <div className="space-y-1">
+              <div className="flex items-center space-x-3">
+                <Switch id="resume" checked={false} disabled />
+                <Label htmlFor="resume" className="text-slate-500">
+                  Resume from Checkpoint (coming soon)
+                </Label>
+              </div>
+              <p className="text-xs text-slate-500 pl-[52px]">
+                Not available in this build yet: it requires picking a specific
+                checkpoint, which there's no way to do here. Start a new
+                training run instead.
+              </p>
             </div>
           </section>
 

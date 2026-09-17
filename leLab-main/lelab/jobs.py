@@ -122,10 +122,17 @@ class MetricsHistoryPoint(BaseModel):
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return True if a process with this PID exists. Cheap; uses signal 0."""
+    """Return True if a process with this PID exists. Cheap; uses signal 0.
+
+    Catches OSError broadly, not just ProcessLookupError/PermissionError:
+    Windows can raise a bare OSError (e.g. WinError 87, "The parameter is
+    incorrect") for a stale/reused pid that doesn't map to either of those,
+    which would otherwise crash the whole server at startup while loading
+    old job records from disk.
+    """
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
+    except OSError:
         return False
     return True
 
