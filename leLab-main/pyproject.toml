@@ -3,7 +3,7 @@ requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "LeLab"
+name = "lelab-gamepad"
 version = "0.1.0"
 description = "LeRobot Lab - A web interface for robotics with lerobot integration"
 readme = "README.md"
@@ -35,7 +35,7 @@ test = [
 ]
 
 [project.scripts]
-lelab = "lelab.scripts.lelab:main"
+lelab-gamepad = "lelab.scripts.lelab:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

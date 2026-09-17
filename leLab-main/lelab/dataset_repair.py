@@ -276,7 +276,7 @@ def repair_local_dataset(repo_id: str) -> str | None:
     except Exception as e:
         logger.info("%s has no usable episode index (%s) — rebuilding it from disk", repo_id, e)
 
-    info = json.loads((root / "meta" / "info.json").read_text())
+    info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
     fps = info["fps"]
     recorded_episodes = info.get("total_episodes", 0)
 
@@ -308,7 +308,7 @@ def repair_local_dataset(repo_id: str) -> str | None:
     info["total_episodes"] = len(rows)
     info["total_frames"] = sum(row["length"] for row in rows)
     info["splits"] = {"train": f"0:{len(rows)}"}
-    (root / "meta" / "info.json").write_text(json.dumps(info, indent=4))
+    (root / "meta" / "info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
 
     message = f"Recovered {len(rows)} episode(s) from an interrupted recording of {repo_id}"
     if lost > 0:

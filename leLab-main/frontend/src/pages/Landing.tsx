@@ -29,6 +29,7 @@ const Landing = () => {
     selectedRecord,
     availableNames,
     isLoading: isLoadingRobots,
+    hasLoadedOnce: hasLoadedRobotsOnce,
     selectRobot,
     createRobot,
     deleteRobot,
@@ -59,19 +60,33 @@ const Landing = () => {
   const location = useLocation();
   const { toast } = useToast();
 
+  const openRecordingModal = () => {
+    setCameras(selectedRecord ? [...(selectedRecord.cameras ?? [])] : []);
+    setShowRecordingModal(true);
+  };
+
   // Open the recording modal pre-filled to resume a dataset, if we arrived
   // here via navigate("/", { state: { resumeDatasetRepoId } }).
+  //
+  // Waits for useRobots()'s initial fetch to finish first (hasLoadedRobotsOnce,
+  // not isLoading -- isLoading starts false too, so it can't distinguish
+  // "haven't started fetching yet" from "done fetching", and this effect can
+  // otherwise fire on the very first render after a fresh navigation to "/",
+  // before that fetch resolves, when selectedRecord is still null. That's
+  // what silently produced an empty Cameras section in Continue Recording.
   useEffect(() => {
+    if (!hasLoadedRobotsOnce) return;
     const repoId = (location.state as { resumeDatasetRepoId?: string } | null)
       ?.resumeDatasetRepoId;
     if (!repoId) return;
     setResumeRepoId(repoId);
     setDatasetName(repoId);
-    setShowRecordingModal(true);
+    openRecordingModal();
     // Clear the navigation state so a later plain visit to "/" (back button,
     // refresh) doesn't re-open the modal.
     navigate(".", { replace: true, state: null });
-  }, [location.state, navigate]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.state, navigate, hasLoadedRobotsOnce]);
 
   // Clear camera state and release streams when returning to landing page
   useEffect(() => {
@@ -94,11 +109,6 @@ const Landing = () => {
       }
     };
   }, []);
-
-  const openRecordingModal = () => {
-    setCameras(selectedRecord ? [...(selectedRecord.cameras ?? [])] : []);
-    setShowRecordingModal(true);
-  };
 
   const handleRecordingModalClose = (open: boolean) => {
     setShowRecordingModal(open);
@@ -173,14 +183,21 @@ const Landing = () => {
       });
       return;
     }
+    if (!resumeRepoId && auth.status !== "authenticated") {
+      toast({
+        title: "Hugging Face login required",
+        description:
+          "Log into Hugging Face before recording: the dataset name needs your username as a prefix.",
+        variant: "destructive",
+      });
+      return;
+    }
 
-    // When resuming, datasetName already holds the exact existing repo_id --
+    // When resuming, datasetName already holds the exact existing repo_id,
     // don't re-namespace it into a new one.
     const datasetRepoId = resumeRepoId
       ? datasetName
-      : auth.status === "authenticated"
-        ? `${auth.username}/${datasetName}`
-        : datasetName;
+      : `${auth.username}/${datasetName}`;
 
     if (cameras.length > 0 && releaseStreamsRef.current) {
       console.log("🔓 Releasing camera streams before starting recording...");

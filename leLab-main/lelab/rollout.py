@@ -258,7 +258,7 @@ def _friendly_hint(error_text: str | None) -> str | None:
     if "failed to set capture_" in low or "actual_width" in low or "actual_height" in low:
         return "A camera doesn't support the configured resolution — open camera settings and click Auto."
     if "permission" in low and ("port" in low or "com" in low):
-        return "Couldn't open the serial port — close anything else using it, or run `lelab --stop`."
+        return "Couldn't open the serial port, close anything else using it, or run `lelab-gamepad --stop`."
     if "relative-action" in low or "relative chunk actions" in low:
         return (
             "This policy was trained with relative actions and needs RTC (chunked) inference. "
@@ -352,7 +352,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         log_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / "inference_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{int(time.time())}.log"
-        log_handle = log_path.open("w", buffering=1)
+        log_handle = log_path.open("w", buffering=1, encoding="utf-8")
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"

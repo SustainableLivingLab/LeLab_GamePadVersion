@@ -79,7 +79,9 @@ function configToRequest(c: TrainingConfig): TrainingRequest {
     log_freq: c.log_freq,
     save_freq: c.save_freq,
     save_checkpoint: c.save_checkpoint,
-    resume: c.resume,
+    // Resume from Checkpoint is disabled in the UI (no way to pick a
+    // checkpoint yet), so this is always false regardless of stored state.
+    resume: false,
     wandb_enable: c.wandb_enable,
     wandb_project: c.wandb_project,
     wandb_entity: c.wandb_entity,
@@ -92,7 +94,10 @@ function configToRequest(c: TrainingConfig): TrainingRequest {
     optimizer_lr: c.optimizer_lr,
     optimizer_weight_decay: c.optimizer_weight_decay,
     optimizer_grad_clip_norm: c.optimizer_grad_clip_norm,
-    use_policy_training_preset: c.use_policy_training_preset,
+    // Use Policy Training Preset is disabled in the UI (turning it off needs
+    // a full optimizer/scheduler config this form doesn't collect), so this
+    // is always true regardless of stored state.
+    use_policy_training_preset: true,
     // GR00T-specific. Only forward the policy_* fields for groot so other
     // policies never receive flags their config doesn't define.
     dataset_image_transforms_enable: c.dataset_image_transforms_enable,

@@ -16,6 +16,6 @@
 from importlib.metadata import PackageNotFoundError, version
 
 try:
-    __version__ = version("lelab")
+    __version__ = version("lelab-gamepad")
 except PackageNotFoundError:
     __version__ = "unknown"
