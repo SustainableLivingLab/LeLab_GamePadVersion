@@ -182,6 +182,11 @@ class CalibrationManager:
             if self.status.calibration_active:
                 return {"success": False, "message": "Calibration already active"}
 
+            from . import gripper_preview as _gripper_preview
+
+            if _gripper_preview.gripper_preview_active:
+                return {"success": False, "message": "A gripper preview is currently active. Stop it first."}
+
             # Reset status and clear any previous calibration data
             self._start_positions = {}
             self._mins = {}

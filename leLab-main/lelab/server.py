@@ -81,6 +81,15 @@ from .teleoperate import (
     handle_teleoperation_status,
 )
 
+# Standalone real-arm gripper preview -- see lelab/gripper_preview.py.
+from .gripper_preview import (
+    GripperPreviewPositionRequest,
+    StartGripperPreviewRequest,
+    handle_set_gripper_preview_position,
+    handle_start_gripper_preview,
+    handle_stop_gripper_preview,
+)
+
 # Training is now job-based; see app/jobs.py.
 from .train import TrainingRequest
 from .update import handle_run_update, handle_update_check
@@ -336,6 +345,27 @@ def gripper_override(request: GripperOverrideRequest):
     gamepad teleoperation session. Pass value: null to release it back to
     L2/R2."""
     return handle_set_gripper_override(request)
+
+
+@app.post("/start-gripper-preview")
+def start_gripper_preview(request: StartGripperPreviewRequest):
+    """Connect just the gripper for on-demand control, independent of a full
+    teleoperation session (which, in gamepad mode, requires a physical
+    controller to even connect) -- Lesson 4.1's real-claw gesture preview."""
+    return handle_start_gripper_preview(request)
+
+
+@app.post("/gripper-preview-position")
+def gripper_preview_position(request: GripperPreviewPositionRequest):
+    """Move the gripper connected via /start-gripper-preview to a 0-100
+    position."""
+    return handle_set_gripper_preview_position(request)
+
+
+@app.post("/stop-gripper-preview")
+def stop_gripper_preview():
+    """Disconnect the gripper preview started via /start-gripper-preview."""
+    return handle_stop_gripper_preview()
 
 
 @app.get("/gamepad-status")
