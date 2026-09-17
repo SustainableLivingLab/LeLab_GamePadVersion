@@ -32,8 +32,15 @@ machine already has.
 Open PowerShell and paste:
 
 ```powershell
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git#subdirectory=leLab-main" --reinstall; lelab-gamepad
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install --python 3.13 "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git#subdirectory=leLab-main" --reinstall; lelab-gamepad
 ```
+
+`--python 3.13` tells `uv` which Python to run the app on; it downloads and manages that version
+itself if you don't already have it, completely separately from any other Python already on your
+machine. This is required, not optional: one of this app's dependencies (`pygame`, used for
+gamepad input) doesn't yet publish a ready-to-use build for the newest Python versions, and
+without this flag `uv` may pick one of those and fail partway through install with a `pygame`
+build error.
 
 This installs a plain CPU build of PyTorch by default, the same way the original LeLab's own
 one-liner does. That's all calibration, gamepad teleoperation, and recording ever need locally;
