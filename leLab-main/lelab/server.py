@@ -887,6 +887,14 @@ def complete_calibration_step():
     return calibration_manager.complete_step()
 
 
+@app.post("/retry-calibration-step")
+def retry_calibration_step():
+    """Retry the motor currently stuck in a "motor_error" state -- redoes
+    just that motor's homing + range recording, leaving every other
+    already-completed motor's calibration untouched."""
+    return calibration_manager.retry_current_step()
+
+
 @app.get("/calibration-configs/{device_type}")
 def get_calibration_configs(device_type: str):
     """Get all calibration config files for a specific device type"""

@@ -17,13 +17,25 @@ Calibration module for the web interface.
 
 This module provides calibration functionality similar to the CLI calibrate.py,
 but adapted for the web interface with step-by-step guidance.
+
+Motors are calibrated ONE AT A TIME, in the device's own bus order (which for
+every robot/teleop this app supports is already the physical bottom-up chain:
+shoulder_pan -> shoulder_lift -> elbow_flex -> wrist_flex -> wrist_roll ->
+gripper for the SO-101, just "gripper" alone for the K12 claw rig). This
+replaces an earlier all-at-once design where the student had to manually
+center EVERY joint simultaneously before a single shared homing step, and a
+discontinuity on any one motor aborted the whole calibration, losing every
+other joint's already-recorded range. Per-motor homing only ever asks for ONE
+joint to be centered at a time, and a failure on one motor (see
+MotorCalibrationRetryable) offers a retry scoped to just that motor via
+retry_current_step(), without touching motors already completed.
 """
 
 import logging
 import threading
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from lerobot.motors import MotorCalibration
@@ -47,12 +59,36 @@ _MIN_VALID_POSITION = 0
 _MAX_VALID_POSITION = 5000
 
 # A single-frame jump larger than this is the encoder wrapping past 0/4095
-# (a ~4096-step delta), not real motion — see CalibrationDiscontinuityError.
+# (a ~4096-step delta), not real motion — see MotorCalibrationRetryable.
 _MAX_POSITION_JUMP = 2000
 
 # A recorded min..max sweep smaller than this many encoder steps means the joint
-# barely moved; the user is warned their range of motion looks insufficient.
+# barely moved; below this the motor is sent back through its own retry loop
+# instead of being accepted.
 _MIN_CALIBRATION_RANGE = 100
+
+# wrist_roll has real mechanical stops (it's NOT free-spinning), but on at
+# least some SO-101 builds those stops are further apart than one 4096-step
+# encoder turn -- so a genuine sweep to both physical limits can cross the
+# encoder's 0/4095 wrap boundary as part of completely normal motion. This
+# matters because lerobot's own MotorsBus._normalize/_unnormalize (see
+# motors_bus.py) has no concept of "which turn" a raw Present_Position
+# reading is in -- it's a straight linear map against calibration's
+# range_min/range_max, with no persistent turn-count tracked anywhere during
+# ordinary teleoperation. So even if this module recorded a technically-true
+# range wider than one turn, that calibration would alias/misread positions
+# unpredictably the moment the joint crossed back over a wrap boundary during
+# later real use -- the single-turn representation is a hard limit of the
+# underlying hardware/software, not something fixable by recording more
+# carefully. The practical, honest fix: still sweep this motor for real (see
+# _step_range_recording_one), but once a reading looks like it wrapped, stop
+# extending the tracked min/max instead of raising a fault -- the recorded
+# range naturally settles on the largest single-turn window reachable from
+# wherever it was centered, which is the most this setup can represent
+# correctly. (Every other SO-101 motor has a real single-turn mechanical
+# range, so a large jump for THEM really does mean bad homing -- only this
+# one motor gets the more forgiving treatment.)
+_MULTI_TURN_MOTORS = {"wrist_roll"}
 
 
 def _is_valid_position(pos: float) -> bool:
@@ -62,14 +98,10 @@ def _is_valid_position(pos: float) -> bool:
     return _MIN_VALID_POSITION < pos < _MAX_VALID_POSITION
 
 
-class CalibrationDiscontinuityError(Exception):
-    """Raised when a motor position reading jumps across the encoder wrap-around.
-
-    The Feetech encoder is 12-bit (0-4095); if calibration starts with a joint
-    near a boundary, moving it past 0 or 4095 produces a single-frame delta of
-    ~4096. The user-side fix is to start with all joints in the middle of their
-    range, as documented in the SO-101 docs.
-    """
+class MotorCalibrationRetryable(Exception):
+    """Raised for a per-motor failure (discontinuity or insufficient range)
+    that should offer a Retry on just the current motor, rather than aborting
+    the whole calibration. Wraps the underlying reason as its message."""
 
 
 @dataclass
@@ -77,14 +109,22 @@ class CalibrationStatus:
     """Status information for calibration process"""
 
     calibration_active: bool = False
-    status: str = "idle"  # "idle", "connecting", "recording", "completed", "error", "stopping"
+    # "idle", "connecting", "homing", "recording", "motor_error", "completed",
+    # "error", "stopping". "homing" and "motor_error" are scoped to
+    # current_motor; "motor_error" offers a retry of just that motor.
+    status: str = "idle"
     device_type: str | None = None
     error: str | None = None
     message: str = ""
-    step: int = 0  # Current calibration step
-    total_steps: int = 1  # Total number of calibration steps
-    current_positions: dict[str, float] = None
-    recorded_ranges: dict[str, dict[str, float]] = None  # {motor: {min: val, max: val, current: val}}
+    # Every motor on this device's bus, in bottom-up physical order.
+    motor_order: list[str] = field(default_factory=list)
+    current_motor: str | None = None
+    current_motor_index: int = 0
+    completed_motors: list[str] = field(default_factory=list)
+    current_positions: dict[str, float] | None = None
+    # Keyed by motor name; only the current (and previously completed, left
+    # as-is) motors have entries. {motor: {min, max, current}}.
+    recorded_ranges: dict[str, dict[str, float]] | None = None
 
 
 @dataclass
@@ -97,7 +137,7 @@ class CalibrationRequest:
     robot_name: str | None = None  # When set, write port + config back into the robot record on success
     # Which Robot subclass to build for device_type=="robot". "so101_follower" is the
     # full 6-motor arm (default, unchanged behavior); "claw_follower" is the K12 app's
-    # single claw-servo rig (see lelab/claw_follower.py). Ignored for device_type=="teleop".
+    # single claw-servo rig (see lelab/claw_follower.py).
     robot_type: str = "so101_follower"
 
 
@@ -110,12 +150,17 @@ class CalibrationManager:
         self.calibration_thread: threading.Thread | None = None
         self.stop_calibration = False
         self._status_lock = threading.Lock()
+        # Set by complete_step() to advance out of a blocking homing/recording
+        # wait; set by retry_current_step() to advance out of a blocking
+        # motor_error wait. Two separate events so a stray late click on one
+        # button can't be misread as the other while the worker has already
+        # moved on.
         self._step_complete = threading.Event()
+        self._retry_requested = threading.Event()
         self._recording_active = False
-        self._start_positions = {}
-        self._mins = {}
-        self._maxes = {}
-        self._homing_offsets = {}
+        self._mins: dict[str, float] = {}
+        self._maxes: dict[str, float] = {}
+        self._homing_offsets: dict[str, float] = {}
         self._current_request: CalibrationRequest | None = None
 
         # Initialize logging
@@ -124,50 +169,54 @@ class CalibrationManager:
     def get_status(self) -> CalibrationStatus:
         """Get current calibration status"""
         with self._status_lock:
-            # Update current positions if we're recording and device is connected
-            if self.status.status == "recording" and self.device and self.device.is_connected:
-                try:
-                    # Try reading positions with quick retry on port contention
-                    positions = None
-                    for attempt in range(2):  # Quick retry for status updates
-                        try:
-                            positions = self.device.bus.sync_read("Present_Position", normalize=False)
-                            break
-                        except Exception as read_error:
-                            if "Port is in use" in str(read_error) and attempt < 1:
-                                time.sleep(0.005)  # Very short delay
-                                continue
-                            else:
-                                raise read_error
-
-                    if positions:
-                        # Update recorded ranges
-                        if not self.status.recorded_ranges:
-                            self.status.recorded_ranges = {}
-
-                        for motor, pos in positions.items():
-                            # Filter out invalid readings (0, negative, or extreme values)
-                            if not _is_valid_position(pos):
-                                continue  # Skip invalid readings
-
-                            if motor not in self.status.recorded_ranges:
-                                self.status.recorded_ranges[motor] = {"min": pos, "max": pos, "current": pos}
-                            else:
-                                self.status.recorded_ranges[motor]["current"] = pos
-                                self.status.recorded_ranges[motor]["min"] = min(
-                                    self.status.recorded_ranges[motor]["min"], pos
-                                )
-                                self.status.recorded_ranges[motor]["max"] = max(
-                                    self.status.recorded_ranges[motor]["max"], pos
-                                )
-                except Exception as e:
-                    # Reduce log spam by using debug level for expected port contention
-                    if "Port is in use" in str(e):
-                        logger.debug(f"Port busy during position read: {e}")
-                    else:
-                        logger.warning(f"Failed to read positions: {e}")
+            # Live position feed while a step is actively waiting on the
+            # student (homing: watching them center the joint; recording:
+            # watching them sweep it) -- device reads happen here, off the
+            # worker thread, same as before.
+            if self.status.status in ("homing", "recording") and self.device and self.device.is_connected:
+                positions = self._safe_read_all_positions()
+                if positions:
+                    self.status.current_positions = positions
+                    motor = self.status.current_motor
+                    if self.status.status == "recording" and motor and motor in positions:
+                        pos = positions[motor]
+                        if _is_valid_position(pos):
+                            # Mirrors the worker's own _mins/_maxes rather than
+                            # tracking min/max independently here -- those are
+                            # the single source of truth for what actually
+                            # gets saved (and, for a _MULTI_TURN_MOTORS entry
+                            # like wrist_roll, already apply the same
+                            # wrap-tolerant clamping the worker's own sweep
+                            # loop does; duplicating that logic here would
+                            # risk the displayed range drifting out of sync
+                            # with what's really being recorded). `current`
+                            # always follows the latest raw read regardless,
+                            # so the live marker keeps moving.
+                            if not self.status.recorded_ranges:
+                                self.status.recorded_ranges = {}
+                            self.status.recorded_ranges[motor] = {
+                                "min": self._mins.get(motor, pos),
+                                "max": self._maxes.get(motor, pos),
+                                "current": pos,
+                            }
 
             return self.status
+
+    def _safe_read_all_positions(self) -> dict[str, float] | None:
+        """Best-effort Present_Position read with a couple of quick retries on
+        transient port contention (a concurrent request racing this same
+        bus) -- used by both the status poller above and the worker's own
+        loops below."""
+        for attempt in range(2):
+            try:
+                return self.device.bus.sync_read("Present_Position", normalize=False)
+            except Exception as read_error:
+                if "Port is in use" in str(read_error) and attempt < 1:
+                    time.sleep(0.005)
+                    continue
+                if "Port is in use" not in str(read_error):
+                    logger.debug(f"Failed to read positions: {read_error}")
+                return None
 
     def _update_status(self, **kwargs):
         """Update calibration status thread-safely"""
@@ -188,7 +237,6 @@ class CalibrationManager:
                 return {"success": False, "message": "A gripper preview is currently active. Stop it first."}
 
             # Reset status and clear any previous calibration data
-            self._start_positions = {}
             self._mins = {}
             self._maxes = {}
             self._homing_offsets = {}
@@ -199,7 +247,10 @@ class CalibrationManager:
                 device_type=request.device_type,
                 error=None,
                 message=f"Starting calibration for {request.device_type}",
-                step=0,
+                motor_order=[],
+                current_motor=None,
+                current_motor_index=0,
+                completed_motors=[],
                 current_positions=None,
                 recorded_ranges=None,
             )
@@ -211,6 +262,7 @@ class CalibrationManager:
             )
             self.stop_calibration = False
             self._step_complete.clear()
+            self._retry_requested.clear()
             self.calibration_thread.start()
 
             return {"success": True, "message": "Calibration started"}
@@ -223,22 +275,40 @@ class CalibrationManager:
             return {"success": False, "message": str(e)}
 
     def complete_step(self) -> dict[str, Any]:
-        """Complete the current calibration step"""
+        """Advance out of the current blocking step: confirms this motor is
+        centered (status=="homing") or that its range sweep is done
+        (status=="recording")."""
         try:
             if not self.status.calibration_active:
                 return {"success": False, "message": "No calibration active"}
 
-            if self.status.status == "recording":
-                # Complete recording step
-                self._recording_active = False
-                self._step_complete.set()
-                return {"success": True, "message": "Range recording completed"}
-
-            else:
+            if self.status.status not in ("homing", "recording"):
                 return {"success": False, "message": f"Cannot complete step in status: {self.status.status}"}
+
+            self._recording_active = False
+            self._step_complete.set()
+            return {"success": True, "message": "Step completed"}
 
         except Exception as e:
             logger.error(f"Error completing step: {e}")
+            return {"success": False, "message": str(e)}
+
+    def retry_current_step(self) -> dict[str, Any]:
+        """Retry the motor currently sitting in a "motor_error" state: redoes
+        its homing + range recording from scratch, without disturbing any
+        other motor's already-recorded calibration."""
+        try:
+            if not self.status.calibration_active:
+                return {"success": False, "message": "No calibration active"}
+
+            if self.status.status != "motor_error":
+                return {"success": False, "message": f"Nothing to retry in status: {self.status.status}"}
+
+            self._retry_requested.set()
+            return {"success": True, "message": "Retrying current motor"}
+
+        except Exception as e:
+            logger.error(f"Error retrying step: {e}")
             return {"success": False, "message": str(e)}
 
     def stop_calibration_process(self) -> dict[str, Any]:
@@ -251,6 +321,7 @@ class CalibrationManager:
             self.stop_calibration = True
             self._recording_active = False
             self._step_complete.set()  # Unblock any waiting step
+            self._retry_requested.set()  # Unblock a waiting retry too
 
             self._update_status(status="stopping", message="Stopping calibration...")
 
@@ -312,21 +383,31 @@ class CalibrationManager:
                 self._cleanup_and_finish("Calibration cancelled")
                 return
 
-            # Start Step 1: Homing
-            self._step_homing()
+            # Bus order is already the physical bottom-up chain for every
+            # device this app supports (see this module's own docstring).
+            motor_order = list(self.device.bus.motors.keys())
+            self._update_status(motor_order=motor_order, completed_motors=[], current_motor_index=0)
 
-            if self.stop_calibration:
-                logger.info("Calibration stopped after homing step")
-                self._cleanup_and_finish("Calibration cancelled")
-                return
+            # Disable torque and switch to position mode ONCE up front, same
+            # as before -- this doesn't move anything or depend on any
+            # motor's own homing, just prepares the bus for manual movement
+            # and later Goal_Position writes.
+            self.device.bus.disable_torque()
+            for motor in self.device.bus.motors:
+                self.device.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+            self.device.bus.reset_calibration()
 
-            # Start Step 2: Range Recording
-            self._step_range_recording()
+            for index, motor in enumerate(motor_order):
+                if self.stop_calibration:
+                    self._cleanup_and_finish("Calibration cancelled")
+                    return
 
-            if self.stop_calibration:
-                logger.info("Calibration stopped after recording step")
-                self._cleanup_and_finish("Calibration cancelled")
-                return
+                self._update_status(current_motor_index=index)
+                self._calibrate_one_motor(motor)
+
+                if self.stop_calibration:
+                    self._cleanup_and_finish("Calibration cancelled")
+                    return
 
             # Complete calibration
             self._complete_calibration()
@@ -334,10 +415,6 @@ class CalibrationManager:
             logger.info("Calibration completed successfully")
             self._cleanup_and_finish("Calibration completed successfully", status="completed")
 
-        except CalibrationDiscontinuityError as e:
-            logger.error(f"Calibration discontinuity: {e}")
-            self._update_status(error=str(e))
-            self._cleanup_and_finish(str(e), status="error")
         except Exception as e:
             logger.error(f"Calibration error: {e}")
             logger.error(traceback.format_exc())
@@ -352,158 +429,177 @@ class CalibrationManager:
                 )
                 self._cleanup_and_finish("Calibration stopped", status="idle")
 
-    def _step_homing(self):
-        """Auto-capture homing offsets from the device's current position."""
-        logger.info("Setting homing offsets from current position")
-
-        # Disable torque to allow manual movement during recording
-        self.device.bus.disable_torque()
-        for motor in self.device.bus.motors:
-            self.device.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
-
-        self.device.bus.reset_calibration()
-        actual_positions = self.device.bus.sync_read("Present_Position", normalize=False)
-        logger.info(f"Current positions for homing: {actual_positions}")
-
-        self._homing_offsets = self.device.bus._get_half_turn_homings(actual_positions)
-        logger.info(f"Calculated homing offsets: {self._homing_offsets}")
-
-        for motor, offset in self._homing_offsets.items():
-            self.device.bus.write("Homing_Offset", motor, offset)
-
-    def _step_range_recording(self):
-        """Record range of motion as the user moves all joints."""
-        logger.info("Starting range recording step")
-
-        # Initialize range tracking with retry and validation
-        self._start_positions = {}
-        for attempt in range(5):  # Try multiple times to get valid initial positions
+    def _calibrate_one_motor(self, motor: str):
+        """Home + record range for a single motor, looping back to redo both
+        (re-prompting the student to re-center it) on a retryable failure,
+        until it succeeds or the whole calibration is stopped/cancelled.
+        Motors already appended to completed_motors before this call are
+        untouched regardless of how many retries this one takes."""
+        while True:
             try:
-                positions = self.device.bus.sync_read("Present_Position", normalize=False)
-                # Validate initial positions
-                valid_positions = {}
-                for motor, pos in positions.items():
-                    if _is_valid_position(pos):
-                        valid_positions[motor] = pos
+                self._step_homing_one(motor)
+                if self.stop_calibration:
+                    return
 
-                if len(valid_positions) == len(positions):  # All positions are valid
-                    self._start_positions = valid_positions
-                    break
-                else:
-                    logger.warning(f"Attempt {attempt + 1}: Got invalid initial positions, retrying...")
-                    time.sleep(0.1)
-            except Exception as e:
-                logger.warning(f"Attempt {attempt + 1}: Failed to read initial positions: {e}")
-                time.sleep(0.1)
+                self._step_range_recording_one(motor)
+                if self.stop_calibration:
+                    return
 
-        if not self._start_positions:
-            raise RuntimeError("Could not get valid initial positions after multiple attempts")
+                with self._status_lock:
+                    if motor not in self.status.completed_motors:
+                        self.status.completed_motors = [*self.status.completed_motors, motor]
+                return
 
-        logger.info(f"Starting positions for range recording: {self._start_positions}")
+            except MotorCalibrationRetryable as e:
+                if self.stop_calibration:
+                    return
+                logger.warning(f"Retryable calibration failure on {motor}: {e}")
+                self._enter_motor_error(motor, str(e))
+                self._wait_for_retry_or_stop()
+                if self.stop_calibration:
+                    return
+                # Loop back around and redo this same motor's homing.
 
-        self._mins = self._start_positions.copy()
-        self._maxes = self._start_positions.copy()
-        logger.info(f"Initialized mins: {self._mins}")
-        logger.info(f"Initialized maxes: {self._maxes}")
-
+    def _enter_motor_error(self, motor: str, message: str):
+        self._retry_requested.clear()
         self._update_status(
-            status="recording",
-            step=1,
-            message="Move ALL joints through their FULL ranges of motion - from minimum to maximum positions. Ensure each joint moves significantly from its starting position.",
-            recorded_ranges={
-                motor: {"min": pos, "max": pos, "current": pos}
-                for motor, pos in self._start_positions.items()
-            },
+            status="motor_error",
+            current_motor=motor,
+            error=message,
+            message=message,
         )
 
-        self._recording_active = True
-        prev_positions: dict[str, int] = dict(self._start_positions)
+    def _wait_for_retry_or_stop(self):
+        while not self._retry_requested.is_set() and not self.stop_calibration:
+            time.sleep(0.05)
+        self._retry_requested.clear()
 
-        # Record positions until user completes step
+    def _step_homing_one(self, motor: str):
+        """Blocks until the student confirms this ONE motor is centered
+        (via complete_step()), then captures its homing offset from
+        whatever position it's actually sitting at right then. Only ever
+        asks for one joint at a time -- the earlier all-at-once design
+        needed the WHOLE arm centered simultaneously before this step,
+        which is what made it hard to get right."""
+        logger.info(f"Waiting for {motor} to be centered")
+        self._update_status(
+            status="homing",
+            current_motor=motor,
+            message=f"Move {motor.replace('_', ' ')} to the middle of its range of motion, then click Continue.",
+        )
+        self._recording_active = False
+        self._step_complete.clear()
+
         while not self._step_complete.is_set() and not self.stop_calibration:
-            try:
-                # Try reading positions with retry on port contention
-                positions = None
-                for attempt in range(3):  # Try up to 3 times
-                    try:
-                        positions = self.device.bus.sync_read("Present_Position", normalize=False)
-                        break  # Success, exit retry loop
-                    except Exception as read_error:
-                        if "Port is in use" in str(read_error) and attempt < 2:
-                            time.sleep(0.01)  # Short delay before retry
-                            continue
+            time.sleep(0.05)
+        if self.stop_calibration:
+            return
+        self._step_complete.clear()
+
+        positions = self._safe_read_all_positions() or {}
+        pos = positions.get(motor)
+        if pos is None or not _is_valid_position(pos):
+            # Retry the read a few times before giving up on this attempt --
+            # a single bad frame here would otherwise mis-home the motor.
+            for _ in range(5):
+                time.sleep(0.05)
+                positions = self._safe_read_all_positions() or {}
+                pos = positions.get(motor)
+                if pos is not None and _is_valid_position(pos):
+                    break
+            if pos is None or not _is_valid_position(pos):
+                raise MotorCalibrationRetryable(
+                    f"Could not read {motor}'s position to set its center. Check the connection and retry."
+                )
+
+        logger.info(f"Homing {motor} from current position {pos}")
+        offset = self.device.bus._get_half_turn_homings({motor: pos})[motor]
+        self._homing_offsets[motor] = offset
+        self.device.bus.write("Homing_Offset", motor, offset)
+
+    def _step_range_recording_one(self, motor: str):
+        """Record min/max for a single motor as the student sweeps it
+        through its range, blocking until they click Continue. Raises
+        MotorCalibrationRetryable (caught by _calibrate_one_motor, which
+        re-prompts homing for just this motor) on an insufficient recorded
+        range -- and, for a normal (single-turn) motor, on a discontinuity
+        too. For a _MULTI_TURN_MOTORS entry, a jump is NOT treated as a
+        fault (see that set's own comment): the sample is just skipped, so
+        min/max stop extending once the sweep runs past the edge of what's
+        safely trackable in one encoder turn, instead of erroring out."""
+        multi_turn = motor in _MULTI_TURN_MOTORS
+        logger.info(f"Starting range recording for {motor}" + (" (multi-turn-safe)" if multi_turn else ""))
+
+        start_pos = None
+        for attempt in range(5):
+            positions = self._safe_read_all_positions() or {}
+            candidate = positions.get(motor)
+            if candidate is not None and _is_valid_position(candidate):
+                start_pos = candidate
+                break
+            logger.warning(f"Attempt {attempt + 1}: invalid initial position for {motor}, retrying...")
+            time.sleep(0.1)
+
+        if start_pos is None:
+            raise MotorCalibrationRetryable(f"Could not get a valid starting position for {motor}.")
+
+        logger.info(f"Starting position for {motor}: {start_pos}")
+        self._mins[motor] = start_pos
+        self._maxes[motor] = start_pos
+
+        with self._status_lock:
+            recorded_ranges = dict(self.status.recorded_ranges or {})
+            recorded_ranges[motor] = {"min": start_pos, "max": start_pos, "current": start_pos}
+            self.status.recorded_ranges = recorded_ranges
+
+        message = f"Move {motor.replace('_', ' ')} through its FULL range of motion, then click Continue."
+        if multi_turn:
+            message += (
+                " If the range stops growing near one end before you reach the physical stop, that's the "
+                "sensor's own limit, not a fault -- click Continue whenever you're satisfied."
+            )
+        self._update_status(status="recording", current_motor=motor, message=message)
+
+        self._recording_active = True
+        self._step_complete.clear()
+        prev_pos = start_pos
+
+        while not self._step_complete.is_set() and not self.stop_calibration:
+            positions = self._safe_read_all_positions()
+            if positions:
+                pos = positions.get(motor)
+                if pos is not None and _is_valid_position(pos):
+                    if abs(pos - prev_pos) > _MAX_POSITION_JUMP:
+                        if multi_turn:
+                            logger.debug(
+                                f"{motor}: ignoring apparent wrap (prev={prev_pos}, new={pos}) -- past the "
+                                "edge of what's safely trackable in one turn."
+                            )
                         else:
-                            raise read_error  # Re-raise if not port contention or final attempt
+                            raise MotorCalibrationRetryable(
+                                f"{motor.replace('_', ' ')} jumped too far in one step (an encoder "
+                                "wrap-around) -- it likely wasn't centered closely enough. Try again, moving "
+                                "it to the middle of its range before continuing."
+                            )
+                    else:
+                        prev_pos = pos
+                        self._mins[motor] = min(self._mins[motor], pos)
+                        self._maxes[motor] = max(self._maxes[motor], pos)
 
-                if positions:
-                    # Validate the readings - filter out invalid/zero values
-                    valid_positions = {}
-                    for motor, pos in positions.items():
-                        # Filter out clearly invalid readings (0, negative, or extreme values)
-                        if _is_valid_position(pos):
-                            valid_positions[motor] = pos
-                        else:
-                            logger.debug(f"Filtered invalid position for {motor}: {pos}")
-
-                    # Only update if we have valid readings
-                    if valid_positions:
-                        for motor, pos in valid_positions.items():
-                            if (
-                                motor in prev_positions
-                                and abs(pos - prev_positions[motor]) > _MAX_POSITION_JUMP
-                            ):
-                                raise CalibrationDiscontinuityError(
-                                    "Motor discontinuity detected. Make sure to start "
-                                    "the calibration with the robot in a middle position "
-                                    "- all joints in the middle of their ranges."
-                                )
-                            prev_positions[motor] = pos
-                            if motor in self._mins:
-                                self._mins[motor] = min(self._mins[motor], pos)
-                                self._maxes[motor] = max(self._maxes[motor], pos)
-
-                time.sleep(0.05)  # 20Hz update rate
-            except CalibrationDiscontinuityError:
-                raise
-            except Exception as e:
-                if "Port is in use" in str(e):
-                    logger.debug(f"Port busy during position read: {e}")
-                else:
-                    logger.warning(f"Error reading positions during recording: {e}")
-                # Increase sleep time on error to reduce port contention
-                time.sleep(0.2)
+            time.sleep(0.05)
 
         if self.stop_calibration:
-            logger.info("Range recording step cancelled due to stop request")
             return
-
-        # Log the final recorded ranges for debugging
-        logger.info("Final recorded ranges:")
-        for motor in self._mins:
-            logger.info(
-                f"  {motor}: min={self._mins[motor]}, max={self._maxes[motor]}, range={self._maxes[motor] - self._mins[motor]}"
-            )
-
-        # Validate ranges
-        same_min_max = [motor for motor in self._mins if self._mins[motor] == self._maxes[motor]]
-        if same_min_max:
-            raise ValueError(f"Some motors have the same min and max values: {same_min_max}")
-
-        # Check for insufficient range movement (less than 100 motor steps)
-        insufficient_range = []
-        for motor in self._mins:
-            range_diff = self._maxes[motor] - self._mins[motor]
-            if range_diff < _MIN_CALIBRATION_RANGE:
-                insufficient_range.append(f"{motor}: {range_diff}")
-
-        if insufficient_range:
-            logger.warning(
-                f"Some motors may not have been moved through sufficient range: {insufficient_range}"
-            )
-            logger.warning("Consider moving all joints through their full range of motion during calibration")
-
         self._step_complete.clear()
-        logger.info("Range recording step completed")
+
+        range_diff = self._maxes[motor] - self._mins[motor]
+        logger.info(f"Recorded range for {motor}: min={self._mins[motor]}, max={self._maxes[motor]}, range={range_diff}")
+
+        if range_diff < _MIN_CALIBRATION_RANGE:
+            raise MotorCalibrationRetryable(
+                f"{motor.replace('_', ' ')} only moved {range_diff} steps -- move it through more of its "
+                "range before continuing."
+            )
 
     def _complete_calibration(self):
         """Complete the calibration and save results"""
