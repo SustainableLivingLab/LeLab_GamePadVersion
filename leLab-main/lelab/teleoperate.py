@@ -110,6 +110,15 @@ def get_joint_positions_from_robot(robot) -> dict[str, float]:
         return joint_positions
 
     except Exception as e:
+        # See the matching comment in teleoperate_worker's own send_action
+        # except-block (teleoperate.py): a serial exception mid-read can leave
+        # scservo_sdk's PortHandler.is_using stuck True forever, permanently
+        # rejecting every future packet with "Port is in use!" on this same
+        # thread. Force it back open here too, since this read runs from the
+        # same worker loop and could just as easily be what got stuck.
+        port_handler = getattr(getattr(robot, "bus", None), "port_handler", None)
+        if port_handler is not None and getattr(port_handler, "is_using", False):
+            port_handler.is_using = False
         logger.error(f"Error getting joint positions: {e}")
         return dict.fromkeys(motor_to_urdf_mapping.values(), 0.0)
 
@@ -297,16 +306,27 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                         # dropped controller (freezes in place, retries the
                         # connection -- see GamepadSO101Teleop/ClawGamepadTeleop's
                         # own try/except). This one is for what THAT can't
-                        # cover: robot.send_action() itself failing -- most
-                        # commonly the serial bus being momentarily busy (a
-                        # concurrent /joint-positions poll racing this same
-                        # thread's own bus access, "[TxRxResult] Port is in
-                        # use!"). Previously that propagated straight out of
-                        # this loop, hitting the except/finally below and
-                        # silently killing the WHOLE session -- disconnecting
-                        # both devices -- over one transient write. Log and
-                        # skip this one tick instead, same idea as the
-                        # joint-broadcast step just below already does.
+                        # cover: robot.send_action() itself failing.
+                        #
+                        # The usual cause is scservo_sdk's own PortHandler.is_using
+                        # busy-flag: txPacket() sets it True before writing and
+                        # only clears it after a successful write or a clean
+                        # TX_FAIL -- but if the underlying serial write raises
+                        # (a transient USB/driver hiccup), that exception unwinds
+                        # straight past the line that clears it, leaving it stuck
+                        # True forever. Once stuck, EVERY future packet -- on
+                        # this same single thread, no concurrent access needed --
+                        # is immediately rejected with COMM_PORT_BUSY
+                        # ("[TxRxResult] Port is in use!") without even
+                        # attempting real I/O, so the arm freezes at whatever
+                        # position it last reached and never recovers on its
+                        # own. Just logging and retrying (the old fix here)
+                        # doesn't help since the flag never clears itself --
+                        # force it back open so the next tick gets a real
+                        # attempt instead of an instant, permanent rejection.
+                        port_handler = getattr(getattr(robot, "bus", None), "port_handler", None)
+                        if port_handler is not None and getattr(port_handler, "is_using", False):
+                            port_handler.is_using = False
                         logger.error(f"Error during teleoperation tick: {e}")
                         time.sleep(0.001)
                         continue
