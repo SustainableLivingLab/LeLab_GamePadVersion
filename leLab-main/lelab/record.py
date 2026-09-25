@@ -36,7 +36,11 @@ from .dataset_repair import DatasetRepairError, repair_local_dataset
 from .datasets import list_local_datasets
 from .gamepad_teleop import GamepadSO101Teleop, GamepadSO101TeleopConfig
 from .utils.config import setup_calibration_files, with_lelab_tag
-from .utils.devices import safe_disconnect_device
+from .utils.devices import (
+    connect_bus_with_fault_recovery,
+    safe_disconnect_device,
+    sync_goal_to_present,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -830,7 +834,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
     try:
         try:
             logger.info("🔧 ROBOT CONNECTION: Attempting to connect robot...")
-            robot.bus.connect()
+            connect_bus_with_fault_recovery(robot.bus, logger)
             logger.info("✅ ROBOT CONNECTION: Robot bus connected successfully")
         except Exception as e:
             logger.error(f"❌ ROBOT CONNECTION: Failed to connect robot: {e}")
@@ -859,6 +863,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
         robot.bus.write_calibration(robot.calibration)
         if teleop is not None and not gamepad_mode:
             teleop.bus.write_calibration(teleop.calibration)
+        sync_goal_to_present(robot.bus, logger)
 
         try:
             logger.info("🔧 CAMERA CONNECTION: Connecting cameras...")

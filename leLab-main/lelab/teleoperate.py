@@ -26,7 +26,12 @@ from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 from .claw_gamepad_teleop import ClawGamepadTeleop, GamepadClawTeleopConfig
 from .gamepad_teleop import GamepadSO101Teleop, GamepadSO101TeleopConfig
 from .utils.config import setup_calibration_files
-from .utils.devices import safe_disconnect_device
+from .utils.devices import (
+    MotorFaultError,
+    connect_bus_with_fault_recovery,
+    safe_disconnect_device,
+    sync_goal_to_present,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +223,9 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         # instead of a generic "failed to start".
         logger.info("Connecting to follower arm...")
         try:
-            robot.bus.connect()
+            connect_bus_with_fault_recovery(robot.bus, logger)
+        except MotorFaultError:
+            raise
         except Exception as e:
             raise RuntimeError(
                 f"Could not connect to the follower arm on {request.follower_port}. "
@@ -239,6 +246,7 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
             logger.info("Writing calibration to motors...")
             robot.bus.write_calibration(robot.calibration)
             teleop_device.bus.write_calibration(teleop_device.calibration)
+            sync_goal_to_present(robot.bus, logger)
 
             # Connect cameras and configure motors
             logger.info("Connecting cameras and configuring motors...")
@@ -252,6 +260,7 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
             # the request thread -- none of it touches pygame.
             logger.info("Writing calibration to motors...")
             robot.bus.write_calibration(robot.calibration)
+            sync_goal_to_present(robot.bus, logger)
             logger.info("Connecting cameras and configuring motors...")
             for cam in robot.cameras.values():
                 cam.connect()

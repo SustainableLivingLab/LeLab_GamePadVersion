@@ -33,7 +33,12 @@ from pydantic import BaseModel
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 from .utils.config import setup_calibration_files
-from .utils.devices import safe_disconnect_device
+from .utils.devices import (
+    MotorFaultError,
+    connect_bus_with_fault_recovery,
+    safe_disconnect_device,
+    sync_goal_to_present,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +89,9 @@ def handle_start_gripper_preview(request: StartGripperPreviewRequest) -> dict[st
         robot = SO101Follower(robot_config)
 
         try:
-            robot.bus.connect()
+            connect_bus_with_fault_recovery(robot.bus, logger)
+        except MotorFaultError:
+            raise
         except Exception as e:
             raise RuntimeError(
                 f"Could not connect to the arm on {request.follower_port}. "
@@ -92,6 +99,7 @@ def handle_start_gripper_preview(request: StartGripperPreviewRequest) -> dict[st
             ) from e
 
         robot.bus.write_calibration(robot.calibration)
+        sync_goal_to_present(robot.bus, logger)
         robot.configure()
 
         current_robot = robot
