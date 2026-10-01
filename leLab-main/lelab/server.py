@@ -37,7 +37,7 @@ from starlette.responses import Response
 from starlette.types import Scope
 
 # Import our custom recording functionality
-from . import datasets as dataset_browser, record as _record
+from . import camera_preview, datasets as dataset_browser, record as _record
 
 # Import our custom calibration functionality
 from .calibrate import CalibrationRequest, calibration_manager
@@ -82,6 +82,7 @@ from .teleoperate import (
 )
 
 # Standalone real-arm gripper preview -- see lelab/gripper_preview.py.
+from .claw_setup import ClawServoSetupRequest, handle_claw_servo_status, handle_setup_claw_servo
 from .gripper_preview import (
     GripperPreviewPositionRequest,
     StartGripperPreviewRequest,
@@ -347,6 +348,20 @@ def gripper_override(request: GripperOverrideRequest):
     return handle_set_gripper_override(request)
 
 
+@app.post("/claw/servo-status")
+def claw_servo_status(request: ClawServoSetupRequest):
+    """Read-only: is the claw on this port already on its own servo ID?"""
+    return handle_claw_servo_status(request)
+
+
+@app.post("/claw/setup-servo")
+def setup_claw_servo(request: ClawServoSetupRequest):
+    """One-time: move the standalone claw's servo (the only one plugged in)
+    onto its own ID, so it can never be confused with the arm's gripper --
+    see lelab/claw_setup.py."""
+    return handle_setup_claw_servo(request)
+
+
 @app.post("/start-gripper-preview")
 def start_gripper_preview(request: StartGripperPreviewRequest):
     """Connect just the gripper for on-demand control, independent of a full
@@ -377,6 +392,7 @@ def gamepad_status():
 
 @app.post("/start-inference")
 def start_inference(request: InferenceRequest):
+    camera_preview.stop_all_previews()  # release cameras the run needs
     result = handle_start_inference(request)
     if not result.get("success"):
         raise HTTPException(
@@ -477,6 +493,7 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.post("/start-recording")
 def start_recording(request: RecordingRequest):
     """Start a dataset recording session"""
+    camera_preview.stop_all_previews()  # release cameras the recording needs
     return handle_start_recording(request)
 
 
@@ -490,6 +507,24 @@ def stop_recording():
 def recording_status():
     """Get the current recording status"""
     return handle_recording_status()
+
+
+@app.get("/camera-preview/{index}")
+def camera_preview_feed(index: int):
+    """Live low-res MJPEG preview of camera `index` while nothing else uses
+    the cameras -- for cameras the browser can't list itself (see
+    camera_preview.py). Ends when recording or a policy run starts."""
+    from . import rollout as _rollout
+
+    def blocked() -> bool:
+        return _record.recording_active or _rollout.inference_active
+
+    if blocked():
+        raise HTTPException(status_code=409, detail="Cameras are in use by a recording or policy run")
+    return StreamingResponse(
+        camera_preview.preview_frames(index, blocked),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 @app.get("/camera-feed/{cam_key}")
@@ -541,6 +576,12 @@ def list_local_datasets_endpoint():
 @app.post("/delete-dataset")
 def delete_dataset(request: DatasetInfoRequest):
     """Remove a recorded dataset directory from local disk."""
+    # Deleting files out from under a recording or a training run crashes it.
+    if _record.recording_active:
+        return {"success": False, "message": "Stop the recording before deleting a dataset."}
+    for job in job_registry.list(limit=1000):
+        if job.state == "running" and job.config.dataset_repo_id == request.dataset_repo_id:
+            return {"success": False, "message": "This dataset is being trained on -- stop training first."}
     return handle_delete_dataset(request)
 
 
@@ -1077,6 +1118,19 @@ def _windows_cameras() -> list[dict[str, Any]]:
     frontend match each index to the browser's ``MediaDeviceInfo.label`` for the
     live preview. Falls back to generic names if pygrabber is unavailable.
     """
+    # FastAPI runs this on a worker-pool thread, and COM must be initialized
+    # per thread -- comtypes only does it for the thread that imported it, so
+    # on any other worker pygrabber failed with "CoInitialize has not been
+    # called" and every camera came back as "Camera N" (browser previews then
+    # can't be matched by name and all go blank).
+    # Left initialized on purpose: pool threads are reused, and uninitializing
+    # while comtypes objects may still be alive is what crashes.
+    import ctypes
+
+    try:
+        ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+    except Exception:
+        pass
     try:
         from pygrabber.dshow_graph import FilterGraph
 

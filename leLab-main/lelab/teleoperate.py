@@ -28,6 +28,8 @@ from .gamepad_teleop import GamepadSO101Teleop, GamepadSO101TeleopConfig
 from .utils.config import setup_calibration_files
 from .utils.devices import (
     MotorFaultError,
+    WrongDeviceError,
+    check_plugged_in_device,
     connect_bus_with_fault_recovery,
     safe_disconnect_device,
     sync_goal_to_present,
@@ -161,11 +163,16 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
     """
     global teleoperation_active, teleoperation_thread, current_robot, current_teleop
 
-    from . import gripper_preview as _gripper_preview, record as _record, rollout as _rollout
+    from . import calibrate as _calibrate, gripper_preview as _gripper_preview, record as _record, rollout as _rollout
 
     with _state_lock:
         if teleoperation_active:
-            return {"success": False, "message": "Teleoperation is already active"}
+            return {
+                "success": False,
+                "message": "Arm/claw control is already running (possibly in another lesson tab). Stop it there first.",
+            }
+        if _calibrate.calibration_manager.status.calibration_active:
+            return {"success": False, "message": "Calibration is currently running. Finish or cancel it first."}
         if _record.recording_active:
             return {"success": False, "message": "Recording is currently active. Stop it first."}
         if _rollout.inference_active:
@@ -223,8 +230,11 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         # instead of a generic "failed to start".
         logger.info("Connecting to follower arm...")
         try:
+            check_plugged_in_device(
+                robot.bus, "claw" if request.robot_type == "claw_follower" else "arm", logger
+            )
             connect_bus_with_fault_recovery(robot.bus, logger)
-        except MotorFaultError:
+        except (MotorFaultError, WrongDeviceError):
             raise
         except Exception as e:
             raise RuntimeError(

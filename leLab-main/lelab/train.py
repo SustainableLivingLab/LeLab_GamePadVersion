@@ -186,6 +186,22 @@ def _require_smolvla_extra_if_needed(request: TrainingRequest) -> None:
         )
 
 
+def _require_recorded_episodes(request: TrainingRequest) -> None:
+    """A local dataset with 0 episodes (a recording that failed before saving
+    any) makes lerobot fall back to downloading it from the Hub, which fails
+    with an unhelpful 401. Say what's actually wrong instead."""
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    from .datasets import local_dataset_episode_count
+
+    root = Path(request.dataset_root) if request.dataset_root else HF_LEROBOT_HOME / request.dataset_repo_id
+    if local_dataset_episode_count(root) == 0:
+        raise ValueError(
+            f'The dataset "{request.dataset_repo_id}" has no recorded episodes -- its recording stopped '
+            "before any episode was saved. Pick a dataset with episodes, or record a new one."
+        )
+
+
 def build_training_command(
     request: TrainingRequest,
     output_dir: str,
@@ -230,6 +246,7 @@ def build_training_command(
     is_local_run = job_target is None or job_target.runner != "hf_cloud"
     if is_local_run:
         _require_smolvla_extra_if_needed(request)
+        _require_recorded_episodes(request)
     if request.policy_path:
         policy_path = request.policy_path
         if sys.platform == "win32" and is_local_run and not Path(policy_path).is_dir():

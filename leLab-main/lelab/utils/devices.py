@@ -51,6 +51,76 @@ def release_torque_best_effort(bus: Any, logger: logging.Logger) -> list[str]:
     return failed
 
 
+class WrongDeviceError(RuntimeError):
+    """The motors answering on this port don't match the robot that was
+    picked -- e.g. the standalone claw is plugged into the board but the arm
+    robot was selected, or vice versa."""
+
+
+# The full arm's motors are IDs 1-6 (base to gripper); the standalone claw's
+# single servo is ID 7 (see claw_follower.CLAW_MOTOR_ID). Claws set up before
+# that still answer on 6 -- the same ID as the arm's gripper -- and are told
+# to run the one-time claw servo setup.
+_ARM_IDS = (1, 2, 3, 4, 5, 6)
+_OLD_CLAW_ID = 6
+_CLAW_ID = 7
+_SCAN_IDS = (*_ARM_IDS, _CLAW_ID)
+
+
+def check_plugged_in_device(bus: Any, expect: str, logger: logging.Logger) -> None:
+    """Ping IDs 1-6 on `bus` and refuse to continue if they clearly belong to
+    the other device ("arm" or "claw") than `expect`.
+
+    Classrooms swap one driver board between the arm and the standalone claw
+    by moving the servo cable, so "which one is plugged in" is a real,
+    common mistake. Opens and closes the port itself and writes nothing.
+    Only refuses on an unambiguous mismatch: an arm with a motor or two
+    tripped into overload (which then doesn't answer) still passes, and the
+    normal connect path reports that. A port that won't open raises the
+    usual connection error.
+    """
+    bus.connect(handshake=False)
+    try:
+        found = [motor_id for motor_id in _SCAN_IDS if bus.ping(motor_id, num_retry=2) is not None]
+    finally:
+        port_handler = getattr(bus, "port_handler", None)
+        with suppress(Exception):
+            port_handler.is_using = False
+            port_handler.closePort()
+    logger.info("Motors answering on %s: %s (expected %s)", getattr(bus, "port", "?"), found or "none", expect)
+
+    arm_body_ids = [motor_id for motor_id in found if motor_id in _ARM_IDS and motor_id != _OLD_CLAW_ID]
+    port = getattr(bus, "port", "this port")
+    if not found:
+        raise WrongDeviceError(
+            f"No motors are answering on {port}. Check the {expect}'s servo cable is plugged into the board and "
+            "its power supply is on, then try again."
+        )
+    if expect == "arm":
+        if found == [_CLAW_ID]:
+            raise WrongDeviceError(
+                f"It looks like the standalone claw is plugged into the board on {port}, not the arm. Pick your "
+                "claw robot instead, or plug the arm's servo cable back in."
+            )
+        if found == [_OLD_CLAW_ID]:
+            raise WrongDeviceError(
+                f"Only motor {_OLD_CLAW_ID} answers on {port} -- that's most likely a standalone claw, not the arm. "
+                "Pick your claw robot instead, or plug the arm's servo cable back in."
+            )
+    if expect == "claw":
+        if len(arm_body_ids) >= 3:
+            raise WrongDeviceError(
+                f"It looks like the whole arm is plugged into the board on {port}, not the standalone claw (motors "
+                f"{', '.join(map(str, found))} answer). Pick your arm robot instead, or plug the claw's servo "
+                "cable in."
+            )
+        if _CLAW_ID not in found:
+            raise WrongDeviceError(
+                f"This claw's servo isn't on its own ID yet (it answers as motor {found[0]}). Open Start "
+                "Calibration for this claw -- it walks you through the one-time servo setup first."
+            )
+
+
 def connect_bus_with_fault_recovery(bus: Any, logger: logging.Logger) -> None:
     """bus.connect(), retried while motors are recovering from an overload.
 
@@ -78,8 +148,8 @@ def connect_bus_with_fault_recovery(bus: Any, logger: logging.Logger) -> None:
             if attempt == FAULT_RETRY_ATTEMPTS:
                 raise MotorFaultError(
                     "A motor on the arm isn't responding normally -- it most likely tripped its overload "
-                    "protection (the arm was pushed, stalled, or jerked hard). Wait about 10 seconds, or switch "
-                    "the arm's power off and on, then try again."
+                    "protection (the arm was pushed, stalled, or jerked hard). Unplug the arm's power, wait about "
+                    "15 seconds before plugging it back in (a quick replug isn't enough), then try again."
                 ) from exc
             logger.warning(
                 "Motor handshake failed (attempt %d/%d), retrying in %.1fs: %s",

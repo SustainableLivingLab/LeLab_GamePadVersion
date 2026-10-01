@@ -232,9 +232,25 @@ class CalibrationManager:
                 return {"success": False, "message": "Calibration already active"}
 
             from . import gripper_preview as _gripper_preview
+            from . import record as _record
+            from . import rollout as _rollout
+            from . import teleoperate as _teleoperate
 
+            # Calibrating rewrites the motors' homing offsets and limits; doing
+            # it while ANY other session is driving the same bus (e.g. a
+            # Lesson 2.2 claw session left running on the arm's port) garbles
+            # packets on both sides and sends the arm to wild positions.
             if _gripper_preview.gripper_preview_active:
                 return {"success": False, "message": "A gripper preview is currently active. Stop it first."}
+            if _teleoperate.teleoperation_active:
+                return {
+                    "success": False,
+                    "message": "Arm/claw control is currently running (possibly in another lesson tab). Stop it first.",
+                }
+            if _record.recording_active:
+                return {"success": False, "message": "Recording is currently active. Stop it first."}
+            if _rollout.inference_active:
+                return {"success": False, "message": "Inference is currently active. Stop it first."}
 
             # Reset status and clear any previous calibration data
             self._mins = {}
@@ -374,6 +390,15 @@ class CalibrationManager:
                 self.device = make_teleoperator_from_config(config)
             else:
                 raise ValueError(f"Unknown device type: {request.device_type}")
+
+            # Wrong device on the board (arm vs. standalone claw, which share
+            # one board/port in class): stop before calibration writes anything.
+            if request.device_type == "robot":
+                from .utils.devices import check_plugged_in_device
+
+                check_plugged_in_device(
+                    self.device.bus, "claw" if request.robot_type == "claw_follower" else "arm", logger
+                )
 
             logger.info("Connecting to device...")
             self.device.connect(calibrate=False)

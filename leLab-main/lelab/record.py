@@ -37,6 +37,7 @@ from .datasets import list_local_datasets
 from .gamepad_teleop import GamepadSO101Teleop, GamepadSO101TeleopConfig
 from .utils.config import setup_calibration_files, with_lelab_tag
 from .utils.devices import (
+    check_plugged_in_device,
     connect_bus_with_fault_recovery,
     safe_disconnect_device,
     sync_goal_to_present,
@@ -834,6 +835,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
     try:
         try:
             logger.info("🔧 ROBOT CONNECTION: Attempting to connect robot...")
+            check_plugged_in_device(robot.bus, "arm", logger)
             connect_bus_with_fault_recovery(robot.bus, logger)
             logger.info("✅ ROBOT CONNECTION: Robot bus connected successfully")
         except Exception as e:
@@ -926,16 +928,33 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
 
             logger.info(f"Recording phase completed - events state: {web_events}")
 
-            # Check if exit_early was triggered (use our tracking flag)
-            recording_interrupted_by_exit_early = web_events.get("_exit_early_triggered", False)
-            if recording_interrupted_by_exit_early:
+            # Stop pressed DURING an episode: keep what was recorded (that's
+            # what "Stop Recording" means to someone mid-episode) and end the
+            # session. Without this, the branch below read the stop as a
+            # timeout -> "re-record": the episode was discarded and a reset
+            # phase started that, in untimed sessions, never ends (it doesn't
+            # watch stop_recording) -- the session hung, holding the arm and
+            # cameras.
+            if web_events.get("stop_recording"):
+                if dataset.has_pending_frames():
+                    logger.info(f"🛑 Stop pressed mid-episode -- saving episode {current_episode}")
+                    dataset.save_episode()
+                    saved_episodes += 1
+                    current_episode += 1
+                else:
+                    logger.info("🛑 Stop pressed before any frames were recorded -- nothing to save")
+                    dataset.clear_episode_buffer()
+                break
+
+            # Episode ended by "Finish Episode" (exit_early) or by its timer
+            # running out -- both keep it, like the lerobot CLI. Timing out
+            # used to count as "re-record", which threw away every episode of
+            # a timed session that wasn't ended by hand.
+            if web_events.get("_exit_early_triggered", False):
                 logger.info("🟡 RECORDING PHASE INTERRUPTED BY EXIT_EARLY - proceeding to save episode")
-                # Reset our tracking flag
                 web_events["_exit_early_triggered"] = False
-            else:
-                # Recording completed due to timeout - trigger re-record behavior
-                logger.info("⏰ RECORDING PHASE COMPLETED DUE TO TIMEOUT - triggering re-record")
-                web_events["rerecord_episode"] = True
+            elif not web_events["rerecord_episode"]:
+                logger.info("⏰ Episode time limit reached - saving episode")
 
             # Handle rerecord logic first (before saving)
             if web_events["rerecord_episode"]:

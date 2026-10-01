@@ -440,14 +440,36 @@ def save_robot_record(name: str, data: dict, allow_create: bool = True) -> bool:
 
 
 def delete_robot_record(name: str) -> bool:
-    """Delete a robot record. Returns True if a file was removed."""
+    """Delete a robot record, and its calibration file(s) unless another
+    remaining record still uses them. Returns True if the record was removed.
+
+    Calibration files are named after the robot, and a record counts as
+    "Ready" purely because its file exists (see is_robot_record_clean) -- so
+    leaving the file behind made a NEW robot created under the same name
+    show Ready straight away, silently reusing the deleted robot's (possibly
+    bad) calibration instead of asking for a fresh one.
+    """
     if not is_valid_robot_name(name):
         return False
     path = _robot_record_path(name)
     if not os.path.exists(path):
         return False
+    record = get_robot_record(name) or {}
     os.remove(path)
     logger.info(f"Deleted robot record {name}")
+
+    remaining = list_robot_records()
+    for key, base_dir in (("follower_config", FOLLOWER_CONFIG_PATH), ("leader_config", LEADER_CONFIG_PATH)):
+        config = record.get(key)
+        if not isinstance(config, str) or not config.strip():
+            continue
+        # Case-insensitive: Windows treats Arm1.json and arm1.json as one file.
+        if any(str(other.get(key, "")).lower() == config.lower() for other in remaining):
+            continue
+        config_path = os.path.join(base_dir, config)
+        if os.path.isfile(config_path):
+            os.remove(config_path)
+            logger.info(f"Deleted calibration file {config_path} (robot {name} removed)")
     return True
 
 

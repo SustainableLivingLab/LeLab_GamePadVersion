@@ -37,6 +37,12 @@ from lerobot.robots.so_follower.so_follower import SOFollower
 from .config_claw_follower import ClawFollowerConfig
 
 
+# The standalone claw's servo ID -- deliberately NOT 6, the arm's gripper, so
+# a claw session can never connect to (and drive) a whole arm that happens to
+# be on the board. Existing claws are moved here once via claw_setup.py.
+CLAW_MOTOR_ID = 7
+
+
 class ClawFollower(SOFollower):
     """Single-motor ("gripper" only) variant of `SOFollower`."""
 
@@ -60,7 +66,7 @@ class ClawFollower(SOFollower):
         self.bus = FeetechMotorsBus(
             port=self.config.port,
             motors={
-                "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
+                "gripper": Motor(CLAW_MOTOR_ID, "sts3215", MotorNormMode.RANGE_0_100),
             },
             calibration=self.calibration,
         )

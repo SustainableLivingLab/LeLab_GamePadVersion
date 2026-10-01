@@ -35,6 +35,8 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from .utils.config import setup_calibration_files
 from .utils.devices import (
     MotorFaultError,
+    WrongDeviceError,
+    check_plugged_in_device,
     connect_bus_with_fault_recovery,
     safe_disconnect_device,
     sync_goal_to_present,
@@ -51,6 +53,9 @@ _state_lock = threading.Lock()
 class StartGripperPreviewRequest(BaseModel):
     follower_port: str
     follower_config: str
+    # "so101_follower" previews the full arm's gripper (motor 6);
+    # "claw_follower" the standalone claw (its own servo, see claw_follower.py).
+    robot_type: str = "so101_follower"
 
 
 class GripperPreviewPositionRequest(BaseModel):
@@ -85,16 +90,23 @@ def handle_start_gripper_preview(request: StartGripperPreviewRequest) -> dict[st
     robot = None
     try:
         _, follower_config_name = setup_calibration_files("", request.follower_config)
-        robot_config = SO101FollowerConfig(port=request.follower_port, id=follower_config_name)
-        robot = SO101Follower(robot_config)
+        is_claw = request.robot_type == "claw_follower"
+        if is_claw:
+            from .claw_follower import ClawFollower
+            from .config_claw_follower import ClawFollowerConfig
+
+            robot = ClawFollower(ClawFollowerConfig(port=request.follower_port, id=follower_config_name))
+        else:
+            robot = SO101Follower(SO101FollowerConfig(port=request.follower_port, id=follower_config_name))
 
         try:
+            check_plugged_in_device(robot.bus, "claw" if is_claw else "arm", logger)
             connect_bus_with_fault_recovery(robot.bus, logger)
-        except MotorFaultError:
+        except (MotorFaultError, WrongDeviceError):
             raise
         except Exception as e:
             raise RuntimeError(
-                f"Could not connect to the arm on {request.follower_port}. "
+                f"Could not connect to the {'claw' if is_claw else 'arm'} on {request.follower_port}. "
                 "Make sure it's plugged in and powered on, then try again."
             ) from e
 
