@@ -21,6 +21,7 @@ lives in app/jobs.py.
 import json
 import re
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -39,8 +40,12 @@ class TrainingRequest(BaseModel):
     dataset_episodes: list[int] | None = None
     dataset_image_transforms_enable: bool = False
 
-    # Policy configuration
+    # Policy configuration. policy_type trains that architecture from scratch;
+    # policy_path instead fine-tunes a pretrained checkpoint (Hub id or local
+    # dir, e.g. SMOLVLA_BASE) and takes precedence -- its own config says
+    # which policy type it is.
     policy_type: str = "act"
+    policy_path: str | None = None
 
     # Core training parameters
     steps: int = 10000
@@ -104,6 +109,58 @@ class TrainingRequest(BaseModel):
     config_path: str | None = None
 
 
+SMOLVLA_BASE = "lerobot/smolvla_base"
+
+_IMAGE_PREFIX = "observation.images."
+
+
+def _read_json_file(repo_or_dir: str, filename: str, repo_type: str, revision: str | None = None) -> dict:
+    """A small JSON file from a local directory, or from the Hub (cached)."""
+    local = Path(repo_or_dir) / filename
+    if local.is_file():
+        return json.loads(local.read_text(encoding="utf-8"))
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(repo_id=repo_or_dir, filename=filename, repo_type=repo_type, revision=revision)
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _dataset_camera_keys(request: TrainingRequest) -> list[str]:
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    root = request.dataset_root or str(HF_LEROBOT_HOME / request.dataset_repo_id)
+    if (Path(root) / "meta" / "info.json").is_file():
+        info = _read_json_file(root, "meta/info.json", "dataset")
+    else:
+        info = _read_json_file(request.dataset_repo_id, "meta/info.json", "dataset", request.dataset_revision)
+    return sorted(key for key in info.get("features", {}) if key.startswith(_IMAGE_PREFIX))
+
+
+def camera_rename_map(request: TrainingRequest) -> dict[str, str]:
+    """Map the dataset's camera keys onto the pretrained policy's own.
+
+    A pretrained checkpoint keeps the camera names it was trained with (e.g.
+    smolvla_base's generic camera1/2/3), and lerobot refuses to fine-tune on a
+    dataset whose cameras are named differently unless given a --rename_map.
+    Cameras are paired in sorted-name order; a dataset with fewer cameras than
+    the checkpoint is fine (SmolVLA only needs one), more is an error.
+    """
+    policy_cfg = _read_json_file(request.policy_path, "config.json", "model")
+    policy_cams = sorted(
+        key
+        for key, feature in (policy_cfg.get("input_features") or {}).items()
+        if feature.get("type") == "VISUAL"
+    )
+    dataset_cams = _dataset_camera_keys(request)
+    if not policy_cams or set(dataset_cams) <= set(policy_cams):
+        return {}
+    if len(dataset_cams) > len(policy_cams):
+        raise ValueError(
+            f"Dataset has {len(dataset_cams)} cameras but {request.policy_path} only takes {len(policy_cams)}."
+        )
+    return dict(zip(dataset_cams, policy_cams, strict=False))
+
+
 def build_training_command(
     request: TrainingRequest,
     output_dir: str,
@@ -145,7 +202,31 @@ def build_training_command(
         cmd.extend(["--dataset.video_backend", "pyav"])
 
     # Policy
-    cmd.extend(["--policy.type", request.policy_type])
+    if request.policy_path:
+        policy_path = request.policy_path
+        is_local_run = job_target is None or job_target.runner != "hf_cloud"
+        if sys.platform == "win32" and is_local_run and not Path(policy_path).is_dir():
+            # lerobot stores --policy.path as a pathlib.Path, which on Windows
+            # turns a Hub id like "lerobot/smolvla_base" into
+            # "lerobot\smolvla_base" -- an invalid repo id by the time it
+            # downloads the weights. Download it ourselves (cached after the
+            # first time) and hand lerobot the local folder instead.
+            from huggingface_hub import snapshot_download
+
+            policy_path = snapshot_download(repo_id=policy_path, repo_type="model")
+        # Must be the single "--policy.path=<x>" token: lerobot pre-parses it
+        # (parser.get_path_arg) and argparse rejects the space-separated form.
+        cmd.append(f"--policy.path={policy_path}")
+        rename_map = camera_rename_map(request)
+        if rename_map:
+            cmd.append(f"--rename_map={json.dumps(rename_map)}")
+    else:
+        cmd.extend(["--policy.type", request.policy_type])
+        if request.policy_type == "smolvla":
+            # "From scratch" for SmolVLA means a fresh action expert on top of
+            # the PRETRAINED SmolVLM backbone. lerobot's own default here is
+            # False, which would leave the whole VLM randomly initialised too.
+            cmd.extend(["--policy.load_vlm_weights", "true"])
 
     # Core training params
     cmd.extend(["--steps", str(request.steps)])
@@ -263,5 +344,18 @@ def build_training_command(
         # abort the submit. A resume already pushes back to its source repo, so skip it.
         if request.save_checkpoint and not request.resume:
             cmd.extend(["--save_checkpoint_to_hub", "true"])
+
+    if request.policy_path:
+        # With --policy.path, lerobot reads every other --policy.* flag as an
+        # override of the loaded config, and only accepts the "--policy.x=y"
+        # form for those -- a separate value token is an unrecognized argument.
+        merged: list[str] = []
+        args = iter(cmd)
+        for arg in args:
+            if arg.startswith("--policy.") and "=" not in arg:
+                merged.append(f"{arg}={next(args)}")
+            else:
+                merged.append(arg)
+        cmd = merged
 
     return cmd

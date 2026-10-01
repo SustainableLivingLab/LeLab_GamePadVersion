@@ -187,6 +187,26 @@ def _rollout_inference_args(policy_path: str) -> list[str]:
     return args
 
 
+def _rollout_camera_rename_map(policy_path: str, cameras: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """Map the robot's camera keys onto the policy's, when they differ.
+
+    A policy fine-tuned from a pretrained checkpoint (e.g. smolvla_base) keeps
+    that checkpoint's camera names (camera1, camera2, ...) -- see
+    train.camera_rename_map, which paired the dataset's cameras onto them in
+    sorted-name order. Pairing the live cameras the same way puts each one
+    back in the slot it was trained in. Policies trained from scratch already
+    use the robot's own names, so this returns {} for them.
+    """
+    cfg = _read_policy_config(policy_path)
+    policy_cams = sorted(
+        key for key, feature in (cfg.get("input_features") or {}).items() if feature.get("type") == "VISUAL"
+    )
+    robot_cams = sorted(f"observation.images.{name}" for name in cameras)
+    if not policy_cams or set(robot_cams) <= set(policy_cams):
+        return {}
+    return dict(zip(robot_cams, policy_cams, strict=False))
+
+
 def _format_cameras_arg(cameras: dict[str, dict[str, Any]]) -> str:
     """Convert {name: {type, camera_index, width, height, fps}} into
     lerobot's CLI dict syntax. The frontend key `camera_index` is
@@ -348,6 +368,9 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         ]
         if request.cameras:
             cmd.append(f"--robot.cameras={_format_cameras_arg(request.cameras)}")
+            rename_map = _rollout_camera_rename_map(policy_path, request.cameras)
+            if rename_map:
+                cmd.append(f"--rename_map={json.dumps(rename_map)}")
 
         log_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / "inference_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
