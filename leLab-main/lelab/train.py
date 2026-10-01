@@ -161,6 +161,31 @@ def camera_rename_map(request: TrainingRequest) -> dict[str, str]:
     return dict(zip(dataset_cams, policy_cams, strict=False))
 
 
+def _require_smolvla_extra_if_needed(request: TrainingRequest) -> None:
+    """SmolVLA's dependencies (transformers etc.) are an optional extra, so a
+    normal install doesn't download them. Fail the request up front with the
+    install command (a ValueError -> HTTP 400 in server.py) rather than
+    letting the training subprocess die on an ImportError minutes in."""
+    if request.policy_path:
+        policy_type = _read_json_file(request.policy_path, "config.json", "model").get("type")
+    else:
+        policy_type = request.policy_type
+    if policy_type != "smolvla":
+        return
+
+    import importlib.util
+
+    missing = [name for name in ("transformers", "num2words") if importlib.util.find_spec(name) is None]
+    if missing:
+        raise ValueError(
+            "SmolVLA training needs extra packages that aren't installed ("
+            + ", ".join(missing)
+            + '). In the leLab-main folder run: uv pip install -e ".[smolvla]" -- or, for the one-line '
+            'install, reinstall with "lelab-gamepad[smolvla] @ git+https://github.com/SustainableLivingLab/'
+            'LeLab_GamePadVersion.git@Gokcever1#subdirectory=leLab-main". Then restart LeLab.'
+        )
+
+
 def build_training_command(
     request: TrainingRequest,
     output_dir: str,
@@ -202,9 +227,11 @@ def build_training_command(
         cmd.extend(["--dataset.video_backend", "pyav"])
 
     # Policy
+    is_local_run = job_target is None or job_target.runner != "hf_cloud"
+    if is_local_run:
+        _require_smolvla_extra_if_needed(request)
     if request.policy_path:
         policy_path = request.policy_path
-        is_local_run = job_target is None or job_target.runner != "hf_cloud"
         if sys.platform == "win32" and is_local_run and not Path(policy_path).is_dir():
             # lerobot stores --policy.path as a pathlib.Path, which on Windows
             # turns a Hub id like "lerobot/smolvla_base" into

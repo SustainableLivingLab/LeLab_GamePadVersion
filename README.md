@@ -63,6 +63,13 @@ faster local policy rollout, install it yourself afterward with `pip install tor
 https://download.pytorch.org/whl/cu124` (match the CUDA version to your GPU driver) from inside
 the tool's environment, or follow the manual setup below.
 
+**Training SmolVLA policies locally** needs a few extra packages (`transformers` and friends, a
+sizeable download that arm control, calibration and recording don't use), so they're an optional
+extra. On a machine that will train SmolVLA, use
+`"lelab-gamepad[smolvla] @ git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git@Gokcever1#subdirectory=leLab-main"`
+in place of the `git+...` URL in the one-liner above, or `uv pip install -e ".[smolvla]"` for the
+manual setup. Starting a SmolVLA training run without them shows this same instruction.
+
 This is a separate command from upstream LeLab's own `lelab`, so it installs and runs side by
 side without needing to uninstall anything.
 
