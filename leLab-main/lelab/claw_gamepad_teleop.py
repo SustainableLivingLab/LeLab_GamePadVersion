@@ -51,6 +51,9 @@ from .gamepad_teleop import (
     HOME_MOVE_DURATION_S,
     RECONNECT_INTERVAL_S,
     move_to_home,
+    open_best_joystick,
+    read_axis,
+    read_button,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,7 +67,9 @@ class GamepadClawTeleopConfig(TeleoperatorConfig):
     """
 
     fps: int = FPS
-    joystick_index: int = 0
+    # None = auto-pick the most gamepad-like device (see open_best_joystick);
+    # set an index only to force a specific one.
+    joystick_index: int | None = None
     id: str = field(default="gamepad")
 
 
@@ -127,13 +132,7 @@ class ClawGamepadTeleop(Teleoperator):
             pygame.joystick.quit()
             pygame.joystick.init()
             pygame.event.pump()
-        if pygame.joystick.get_count() == 0:
-            raise RuntimeError(
-                "No gamepad detected. Connect a controller and try again. If you just paired "
-                "it over Bluetooth, wait a few seconds after pairing completes, then retry."
-            )
-        self._joystick = pygame.joystick.Joystick(self.config.joystick_index)
-        self._joystick.init()
+        self._joystick = open_best_joystick(pygame, self.config.joystick_index)
         logger.info(f"Gamepad connected: {self._joystick.get_name()}")
 
     @property
@@ -172,8 +171,8 @@ class ClawGamepadTeleop(Teleoperator):
             pygame.event.pump()
             if pygame.joystick.get_count() == 0:
                 return False
-            joystick = pygame.joystick.Joystick(self.config.joystick_index)
-            joystick.init()
+            # Re-picked, not re-opened by index: unplug/replug can reorder devices.
+            joystick = open_best_joystick(pygame, self.config.joystick_index)
             joystick.get_axis(0)  # confirms the handle actually reads, not just opens
         except Exception:
             return False
@@ -200,10 +199,10 @@ class ClawGamepadTeleop(Teleoperator):
         try:
             pygame.event.pump()
 
-            if self._joystick.get_button(BUTTON_QUIT):
+            if read_button(self._joystick, BUTTON_QUIT):
                 self._quit_requested = True
 
-            if self._joystick.get_button(BUTTON_START_PAUSE):
+            if read_button(self._joystick, BUTTON_START_PAUSE):
                 if not self._start_pause_held:
                     self._start_pause_held = True
                     self._running = not self._running
@@ -213,7 +212,7 @@ class ClawGamepadTeleop(Teleoperator):
             else:
                 self._start_pause_held = False
 
-            if self._joystick.get_button(BUTTON_HOME):
+            if read_button(self._joystick, BUTTON_HOME):
                 if not self._home_held:
                     self._home_held = True
                     if self._running and self._robot is not None:
@@ -228,8 +227,8 @@ class ClawGamepadTeleop(Teleoperator):
             self._last_tick = now
 
             if self._running:
-                l2 = (self._joystick.get_axis(AXIS_L2) + 1.0) / 2.0  # 0 (released) .. 1 (pressed)
-                r2 = (self._joystick.get_axis(AXIS_R2) + 1.0) / 2.0
+                l2 = (read_axis(self._joystick, AXIS_L2, -1.0) + 1.0) / 2.0  # 0 (released) .. 1 (pressed)
+                r2 = (read_axis(self._joystick, AXIS_R2, -1.0) + 1.0) / 2.0
                 gripper_vel = GRIPPER_SIGN * (r2 - l2) * GRIPPER_MAX_PER_S
                 new_gripper = self._targets["gripper"] + gripper_vel * dt
                 self._targets["gripper"] = max(0.0, min(100.0, new_gripper))

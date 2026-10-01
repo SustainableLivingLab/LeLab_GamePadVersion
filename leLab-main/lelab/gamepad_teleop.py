@@ -96,6 +96,90 @@ def apply_deadzone(value: float, deadzone: float = DEADZONE) -> float:
     return 0.0 if abs(value) < deadzone else value
 
 
+# Joystick-device picking. Windows lists anything that registers as a game
+# controller -- Steam's/ViGEm's virtual pads, vJoy, racing wheels, some gaming
+# mice and keyboards -- and the real controller isn't always index 0. Blindly
+# opening index 0 then "connects" fine and the arm silently ignores the real
+# sticks. Names are matched lowercase, as substrings.
+_NOT_A_GAMEPAD = ("vjoy", "wheel", "pedal", "throttle", "flight", "keyboard", "mouse", "accelerometer", "sensor")
+_GAMEPAD_HINTS = (
+    "controller", "gamepad", "xbox", "dualsense", "dualshock", "wireless", "f310", "f710", "ps4", "ps5",
+)
+# The layout every mapping above assumes: 2 sticks + 2 analog triggers as axes.
+MIN_AXES = 6
+MIN_BUTTONS = 10
+
+
+def _gamepad_score(name: str, num_axes: int, num_buttons: int) -> int:
+    lowered = name.lower()
+    score = 0
+    if num_axes >= MIN_AXES and num_buttons >= MIN_BUTTONS:
+        score += 2
+    if any(hint in lowered for hint in _GAMEPAD_HINTS):
+        score += 1
+    if any(bad in lowered for bad in _NOT_A_GAMEPAD):
+        score -= 3
+    return score
+
+
+def open_best_joystick(pygame, preferred_index: int | None = None):
+    """Open the connected device most likely to be the real gamepad.
+
+    Logs every detected device so a wrong pick is diagnosable from the LeLab
+    log alone. `preferred_index` (an explicit config choice) wins when valid;
+    otherwise the best-scoring device does, ties going to the lowest index.
+    Raises RuntimeError when nothing is connected.
+    """
+    count = pygame.joystick.get_count()
+    if count == 0:
+        raise RuntimeError(
+            "No gamepad detected. Connect a controller and try again. If you just paired "
+            "it over Bluetooth, wait a few seconds after pairing completes, then retry."
+        )
+
+    devices = []
+    for index in range(count):
+        joystick = pygame.joystick.Joystick(index)
+        joystick.init()
+        name = joystick.get_name()
+        axes, buttons, hats = joystick.get_numaxes(), joystick.get_numbuttons(), joystick.get_numhats()
+        logger.info("Controller #%d: %r (%d axes, %d buttons, %d hats)", index, name, axes, buttons, hats)
+        devices.append((_gamepad_score(name, axes, buttons), index, joystick))
+
+    if preferred_index is not None and 0 <= preferred_index < count:
+        chosen = devices[preferred_index][2]
+    else:
+        chosen = max(devices, key=lambda d: (d[0], -d[1]))[2]
+    for _, _, joystick in devices:
+        if joystick is not chosen:
+            joystick.quit()
+
+    if chosen.get_numaxes() < MIN_AXES:
+        logger.warning(
+            "Gamepad %r reports only %d axes (expected %d) -- controls on missing axes (usually the "
+            "L2/R2 triggers, i.e. the claw) won't respond. On a Logitech F310/F710, set the switch on "
+            "the back to X, not D.",
+            chosen.get_name(),
+            chosen.get_numaxes(),
+            MIN_AXES,
+        )
+    return chosen
+
+
+def read_axis(js, index: int, default: float = 0.0) -> float:
+    """get_axis() that returns `default` for an axis this controller doesn't
+    have, instead of raising -- a raise inside get_action() reads as "the
+    controller dropped" and sends the session into an endless reconnect loop.
+    Triggers pass default=-1.0 (their released position)."""
+    return js.get_axis(index) if index < js.get_numaxes() else default
+
+
+def read_button(js, index: int) -> bool:
+    """get_button() that treats a button this controller doesn't have as
+    unpressed -- see read_axis()."""
+    return bool(js.get_button(index)) if index < js.get_numbuttons() else False
+
+
 def get_dpad_delta(js) -> float:
     """+1 for D-pad up, -1 for down, 0 otherwise -- works whether the controller
     reports the D-pad as a hat (most Xbox-layout pads) or as buttons (DualSense).
@@ -105,9 +189,9 @@ def get_dpad_delta(js) -> float:
         return float(hat_y)
 
     dpad_delta = 0.0
-    if js.get_button(BUTTON_DPAD_UP):
+    if read_button(js, BUTTON_DPAD_UP):
         dpad_delta += 1.0
-    if js.get_button(BUTTON_DPAD_DOWN):
+    if read_button(js, BUTTON_DPAD_DOWN):
         dpad_delta -= 1.0
     return dpad_delta
 
@@ -128,7 +212,7 @@ def step_targets(
     usual.
     """
     for joint, cfg in JOINT_CONFIG.items():
-        raw = apply_deadzone(js.get_axis(cfg["axis"]), cfg.get("deadzone", DEADZONE))
+        raw = apply_deadzone(read_axis(js, cfg["axis"]), cfg.get("deadzone", DEADZONE))
         vel = cfg["sign"] * raw * cfg["max_deg_per_s"]
         new_val = current_targets[joint] + vel * dt
         current_targets[joint] = max(JOINT_MIN_DEG, min(JOINT_MAX_DEG, new_val))
@@ -147,8 +231,8 @@ def step_targets(
         else:
             current_targets["gripper"] = current + (max_step if gripper_override > current else -max_step)
     else:
-        l2 = (js.get_axis(AXIS_L2) + 1.0) / 2.0  # 0 (released) .. 1 (pressed)
-        r2 = (js.get_axis(AXIS_R2) + 1.0) / 2.0
+        l2 = (read_axis(js, AXIS_L2, -1.0) + 1.0) / 2.0  # 0 (released) .. 1 (pressed)
+        r2 = (read_axis(js, AXIS_R2, -1.0) + 1.0) / 2.0
         gripper_vel = GRIPPER_SIGN * (r2 - l2) * GRIPPER_MAX_PER_S
         new_gripper = current_targets["gripper"] + gripper_vel * dt
         current_targets["gripper"] = max(0.0, min(100.0, new_gripper))
@@ -176,7 +260,9 @@ class GamepadSO101TeleopConfig(TeleoperatorConfig):
     """
 
     fps: int = FPS
-    joystick_index: int = 0
+    # None = auto-pick the most gamepad-like device (see open_best_joystick);
+    # set an index only to force a specific one.
+    joystick_index: int | None = None
     id: str = field(default="gamepad")
 
 
@@ -249,13 +335,7 @@ class GamepadSO101Teleop(Teleoperator):
             pygame.joystick.quit()
             pygame.joystick.init()
             pygame.event.pump()
-        if pygame.joystick.get_count() == 0:
-            raise RuntimeError(
-                "No gamepad detected. Connect a controller and try again. If you just paired "
-                "it over Bluetooth, wait a few seconds after pairing completes, then retry."
-            )
-        self._joystick = pygame.joystick.Joystick(self.config.joystick_index)
-        self._joystick.init()
+        self._joystick = open_best_joystick(pygame, self.config.joystick_index)
         logger.info(f"Gamepad connected: {self._joystick.get_name()}")
 
     @property
@@ -300,8 +380,8 @@ class GamepadSO101Teleop(Teleoperator):
             pygame.event.pump()
             if pygame.joystick.get_count() == 0:
                 return False
-            joystick = pygame.joystick.Joystick(self.config.joystick_index)
-            joystick.init()
+            # Re-picked, not re-opened by index: unplug/replug can reorder devices.
+            joystick = open_best_joystick(pygame, self.config.joystick_index)
             joystick.get_axis(0)  # confirms the handle actually reads, not just opens
         except Exception:
             return False
@@ -329,10 +409,10 @@ class GamepadSO101Teleop(Teleoperator):
         try:
             pygame.event.pump()
 
-            if self._joystick.get_button(BUTTON_QUIT):
+            if read_button(self._joystick, BUTTON_QUIT):
                 self._quit_requested = True
 
-            if self._joystick.get_button(BUTTON_START_PAUSE):
+            if read_button(self._joystick, BUTTON_START_PAUSE):
                 if not self._start_pause_held:
                     self._start_pause_held = True
                     self._running = not self._running
@@ -342,7 +422,7 @@ class GamepadSO101Teleop(Teleoperator):
             else:
                 self._start_pause_held = False
 
-            if self._joystick.get_button(BUTTON_HOME):
+            if read_button(self._joystick, BUTTON_HOME):
                 if not self._home_held:
                     self._home_held = True
                     if self._running and self._robot is not None:
