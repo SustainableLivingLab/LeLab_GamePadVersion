@@ -161,6 +161,54 @@ def connect_bus_with_fault_recovery(bus: Any, logger: logging.Logger) -> None:
             time.sleep(FAULT_RETRY_WAIT_S)
 
 
+# How long a bus read/write keeps retrying after a communication failure
+# before giving up (see make_bus_io_resilient).
+BUS_IO_RETRY_WINDOW_S = 1.0
+BUS_IO_RETRY_PAUSE_S = 0.02
+
+
+def make_bus_io_resilient(bus: Any, logger: logging.Logger) -> None:
+    """Retry the bus's sync_read/sync_write for up to BUS_IO_RETRY_WINDOW_S
+    after a communication failure, instead of failing on the first one.
+
+    lerobot reads every motor once per frame with a single attempt, so one
+    glitch -- a USB hub hiccup, electrical noise, a brief power dip -- makes
+    sync_read raise "There is no status packet!" for all motors at once, and
+    in recording that exception ends the whole session mid-episode.
+    Teleoperation already survives these by retrying the next tick; this gives
+    recording the same tolerance. A failure that outlasts the window (power
+    really off, cable out) still raises, so real faults aren't hidden.
+    """
+
+    def resilient(name: str):
+        original = getattr(bus, name)
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            deadline = time.monotonic() + BUS_IO_RETRY_WINDOW_S
+            failures = 0
+            while True:
+                try:
+                    result = original(*args, **kwargs)
+                    if failures:
+                        logger.warning("Bus %s recovered after %d failed attempt(s)", name, failures)
+                    return result
+                except ConnectionError:
+                    failures += 1
+                    if time.monotonic() >= deadline:
+                        raise
+                    # scservo_sdk can leave the port flagged busy after a
+                    # failed transfer, which would reject every retry.
+                    port_handler = getattr(bus, "port_handler", None)
+                    if port_handler is not None and getattr(port_handler, "is_using", False):
+                        port_handler.is_using = False
+                    time.sleep(BUS_IO_RETRY_PAUSE_S)
+
+        return call
+
+    bus.sync_read = resilient("sync_read")
+    bus.sync_write = resilient("sync_write")
+
+
 def sync_goal_to_present(bus: Any, logger: logging.Logger) -> None:
     """Set every motor's Goal_Position register to where it physically is now.
 

@@ -613,8 +613,9 @@ _HUB_CKPT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@checkpoints/(?P<step_dir>\d+)$"
 _HUB_ROOT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@root$")
 
 
-def _read_checkpoint_config(ckpt: JobCheckpoint) -> dict[str, object]:
-    """Load the pretrained_model/config.json for one checkpoint.
+def _read_checkpoint_config(ckpt: JobCheckpoint, name: str = "config.json") -> dict[str, object]:
+    """Load one JSON file (default config.json) from a checkpoint's
+    pretrained_model dir.
 
     Keyed on the checkpoint's own source/ref shape so it works for training
     jobs and imports alike:
@@ -623,23 +624,51 @@ def _read_checkpoint_config(ckpt: JobCheckpoint) -> dict[str, object]:
                  model repo); both resolve via hf_hub_download.
     """
     if ckpt.source == "local":
-        with open(Path(ckpt.ref) / "config.json", encoding="utf-8") as f:
+        with open(Path(ckpt.ref) / name, encoding="utf-8") as f:
             return json.load(f)
     from huggingface_hub import hf_hub_download
 
     m = _HUB_CKPT_REF_RE.match(ckpt.ref)
     if m:
         repo_id = m.group("repo")
-        filename = f"checkpoints/{m.group('step_dir')}/pretrained_model/config.json"
+        filename = f"checkpoints/{m.group('step_dir')}/pretrained_model/{name}"
     else:
         m = _HUB_ROOT_REF_RE.match(ckpt.ref)
         if not m:
             raise ValueError(f"Bad hub ref: {ckpt.ref!r}")
         repo_id = m.group("repo")
-        filename = "config.json"
+        filename = name
     local_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="model")
-    with open(local_path) as f:
+    with open(local_path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _robot_cameras_for(ckpt: JobCheckpoint, policy_cameras: list[str]) -> tuple[list[str] | None, str | None]:
+    """The robot camera names a checkpoint needs at run time, plus the dataset
+    it was trained on, from its train_config.json (which travels with the
+    model, so this works on any computer).
+
+    A model fine-tuned from a pretrained checkpoint keeps that checkpoint's
+    camera names (smolvla_base: camera1/2/3) and was trained through a
+    rename_map pairing the dataset's cameras onto them -- e.g. top -> camera1,
+    wrist -> camera2, camera3 unused. What the robot needs then is the
+    dataset's cameras, not cameras literally called camera1-3. Without a
+    rename_map the policy's own names are the robot's.
+    Returns (None, None) when train_config.json can't be read.
+    """
+    try:
+        train_cfg = _read_checkpoint_config(ckpt, "train_config.json")
+    except Exception:
+        return None, None
+    dataset_cfg = train_cfg.get("dataset") if isinstance(train_cfg.get("dataset"), dict) else {}
+    dataset_repo_id = dataset_cfg.get("repo_id") if isinstance(dataset_cfg.get("repo_id"), str) else None
+    rename_map = train_cfg.get("rename_map") or {}
+    if not isinstance(rename_map, dict) or not rename_map:
+        return list(policy_cameras), dataset_repo_id
+    short = lambda key: str(key).split(".")[-1]  # noqa: E731
+    mapped_to = {short(policy): short(dataset) for dataset, policy in rename_map.items()}
+    cameras = [mapped_to[name] for name in policy_cameras if name in mapped_to]
+    return (cameras or list(policy_cameras)), dataset_repo_id
 
 
 def _generate_job_id(policy_type: str, dataset_repo_id: str) -> str:
@@ -1110,9 +1139,14 @@ class JobRegistry:
             # takes just the suffix.
             name = full_name.split(".")[-1]
             image_features[name] = {"height": int(height), "width": int(width)}
+        robot_cameras, dataset_repo_id = _robot_cameras_for(match, list(image_features))
         return {
             "policy_type": policy_type,
             "image_features": image_features,
+            # The robot cameras to run it with (see _robot_cameras_for);
+            # None when the checkpoint has no readable train_config.json.
+            "robot_cameras": robot_cameras,
+            "dataset_repo_id": dataset_repo_id,
             "requires_task": policy_type in _LANGUAGE_CONDITIONED_POLICY_TYPES,
         }
 

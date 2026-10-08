@@ -140,6 +140,53 @@ def _resolve_policy_path(policy_ref: str) -> str:
     raise ValueError(f"Unrecognised policy ref: {policy_ref!r}")
 
 
+def _make_locally_loadable(policy_path: str) -> str:
+    """Return a policy dir this install's lerobot can load.
+
+    A model trained on Hugging Face cloud runs the latest lerobot image, which
+    can write config.json fields this pinned lerobot doesn't know (e.g.
+    ``dtype``), and draccus refuses the whole file: "The fields `dtype` are
+    not valid for ACTConfig". Such fields are dropped in a copy (under
+    HF_LEROBOT_HOME/compat_policies) so the downloaded original stays intact.
+    Returns policy_path unchanged when nothing needs dropping.
+    """
+    import dataclasses
+    import hashlib
+    import shutil
+
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    import lerobot.policies.factory  # noqa: F401  registers the policy config classes
+
+    cfg = _read_policy_config(policy_path)
+    try:
+        config_cls = PreTrainedConfig.get_choice_class(cfg.get("type"))
+    except Exception:
+        return policy_path
+    known = {field.name for field in dataclasses.fields(config_cls)}
+    unknown = sorted(key for key in cfg if key != "type" and key not in known)
+    if not unknown:
+        return policy_path
+
+    digest = hashlib.sha1(str(Path(policy_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    compat_dir = Path(HF_LEROBOT_HOME) / "compat_policies" / digest
+    if compat_dir.exists():
+        shutil.rmtree(compat_dir)
+    shutil.copytree(policy_path, compat_dir)
+    for key in unknown:
+        cfg.pop(key, None)
+    with open(compat_dir / "config.json", "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=4)
+    logger.warning(
+        "Policy config has fields this lerobot doesn't know (%s) -- probably trained with a newer lerobot "
+        "(e.g. on Hugging Face cloud). Running a copy without them: %s",
+        ", ".join(unknown),
+        compat_dir,
+    )
+    return str(compat_dir)
+
+
 def _read_policy_config(policy_path: str) -> dict[str, Any]:
     """Load pretrained_model/config.json if present."""
     config_path = Path(policy_path) / "config.json"
@@ -350,7 +397,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         # because lerobot appends `.json` itself when constructing
         # `calibration_dir / f"{id}.json"`.
         follower_id = setup_follower_calibration_file(request.follower_config)
-        policy_path = _resolve_policy_path(request.policy_ref)
+        policy_path = _make_locally_loadable(_resolve_policy_path(request.policy_ref))
 
         cmd = [
             sys.executable,
