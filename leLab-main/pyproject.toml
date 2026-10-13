@@ -30,6 +30,12 @@ dependencies = [
 smolvla = [
     "lerobot[smolvla] @ git+https://github.com/huggingface/lerobot.git@v0.6.0",
 ]
+# Only for machines that train or run pi0.5 policies (transformers + scipy).
+# pi0.5 also needs access to the gated google/paligemma-3b-pt-224 model on the
+# Hugging Face account LeLab is logged into. Install with `uv pip install -e ".[pi]"`.
+pi = [
+    "lerobot[pi] @ git+https://github.com/huggingface/lerobot.git@v0.6.0",
+]
 dev = [
     "pytest>=7.0",
     "ruff>=0.6",

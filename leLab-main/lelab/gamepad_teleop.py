@@ -240,6 +240,39 @@ def step_targets(
     return current_targets
 
 
+def step_targets_mapped(
+    js,
+    current_targets: dict[str, float],
+    dt: float,
+    mapping: dict[str, str],
+    gripper_override: float | None = None,
+) -> dict[str, float]:
+    """step_targets() driven by a gamepad mapping (see gamepad_mapping.py)
+    instead of the fixed layout. The default mapping moves every joint exactly
+    as step_targets() does. Mutates and returns current_targets."""
+    from .gamepad_mapping import InputReader, joint_velocities
+
+    velocities = joint_velocities(InputReader(js), mapping)
+    for joint, vel in velocities.items():
+        if joint == "gripper":
+            continue
+        new_val = current_targets[joint] + vel * dt
+        current_targets[joint] = max(JOINT_MIN_DEG, min(JOINT_MAX_DEG, new_val))
+
+    if gripper_override is not None:
+        current = current_targets["gripper"]
+        max_step = GRIPPER_MAX_PER_S * dt
+        if abs(gripper_override - current) <= max_step:
+            current_targets["gripper"] = gripper_override
+        else:
+            current_targets["gripper"] = current + (max_step if gripper_override > current else -max_step)
+    elif "gripper" in velocities:
+        new_gripper = current_targets["gripper"] + velocities["gripper"] * dt
+        current_targets["gripper"] = max(0.0, min(100.0, new_gripper))
+
+    return current_targets
+
+
 def move_to_home(bus, start: dict, home_position: dict, fps: int, duration_s: float = HOME_MOVE_DURATION_S) -> dict:
     """Blocking, smooth ramp from `start` to `home_position`. Returns the final target dict."""
     steps = max(1, int(duration_s * fps))
@@ -306,6 +339,15 @@ class GamepadSO101Teleop(Teleoperator):
         # to take over just this one axis while gamepad input keeps driving
         # every other joint.
         self._gripper_override: float | None = None
+        # Replaced by the saved mapping in connect().
+        from .gamepad_mapping import DEFAULT_MAPPING
+
+        self._mapping: dict[str, str] = dict(DEFAULT_MAPPING)
+        # Recording-only commands (end / re-record episode): a recording
+        # session sets this to forward them to its own handlers. None
+        # outside a recording, where they do nothing.
+        self._command_handler = None
+        self._held_commands: set[str] = set()
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -337,6 +379,13 @@ class GamepadSO101Teleop(Teleoperator):
             pygame.event.pump()
         self._joystick = open_best_joystick(pygame, self.config.joystick_index)
         logger.info(f"Gamepad connected: {self._joystick.get_name()}")
+        # Which control drives what (K12 lessons' Reconfigure). Read once per
+        # session, so a saved change applies from the next Start Control.
+        from .gamepad_mapping import DEFAULT_MAPPING, load_mapping
+
+        self._mapping = load_mapping()
+        if self._mapping != DEFAULT_MAPPING:
+            logger.info("Using a custom gamepad mapping: %s", self._mapping)
 
     @property
     def is_calibrated(self) -> bool:
@@ -408,11 +457,26 @@ class GamepadSO101Teleop(Teleoperator):
         pygame = self._pygame
         try:
             pygame.event.pump()
+            from .gamepad_mapping import InputReader, command_pressed
 
-            if read_button(self._joystick, BUTTON_QUIT):
-                self._quit_requested = True
+            mapping = self._mapping
+            reader = InputReader(self._joystick)
+            # Nothing to press Start/Pause with: run straight away instead of
+            # leaving the arm unable to ever start.
+            if not mapping.get("start_pause") and not self._running:
+                self._running = True
 
-            if read_button(self._joystick, BUTTON_START_PAUSE):
+            # Recording commands fire once per press (not every tick held).
+            for command in ("end_episode", "rerecord_episode"):
+                if command_pressed(reader, mapping, command):
+                    if command not in self._held_commands:
+                        self._held_commands.add(command)
+                        if self._command_handler is not None:
+                            self._command_handler(command)
+                else:
+                    self._held_commands.discard(command)
+
+            if command_pressed(reader, mapping, "start_pause"):
                 if not self._start_pause_held:
                     self._start_pause_held = True
                     self._running = not self._running
@@ -422,7 +486,7 @@ class GamepadSO101Teleop(Teleoperator):
             else:
                 self._start_pause_held = False
 
-            if read_button(self._joystick, BUTTON_HOME):
+            if command_pressed(reader, mapping, "home"):
                 if not self._home_held:
                     self._home_held = True
                     if self._running and self._robot is not None:
@@ -437,7 +501,7 @@ class GamepadSO101Teleop(Teleoperator):
             self._last_tick = now
 
             if self._running:
-                step_targets(self._joystick, self._targets, dt, self._gripper_override)
+                step_targets_mapped(self._joystick, self._targets, dt, mapping, self._gripper_override)
         except Exception as e:
             # The controller went away mid-read (Bluetooth hiccup, dongle out
             # of range, USB unplug). Freeze the arm in place -- force
@@ -451,6 +515,11 @@ class GamepadSO101Teleop(Teleoperator):
             self._home_held = False
 
         return {f"{joint}.pos": val for joint, val in self._targets.items()}
+
+    def set_command_handler(self, handler) -> None:
+        """Forward the recording commands (``end_episode``,
+        ``rerecord_episode``) to ``handler(name)``; None turns them off."""
+        self._command_handler = handler
 
     def set_gripper_override(self, value: float | None) -> None:
         """Take over the gripper axis with an external 0-100 target (or pass

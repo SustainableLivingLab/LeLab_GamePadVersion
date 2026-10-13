@@ -391,7 +391,7 @@ def _run_prod(*, no_open: bool = False, rebuild: bool = False) -> None:
                         child.terminate()
             except Exception:
                 pass
-            os._exit(0)
+            _hard_exit()
 
         signal.signal(signal.SIGINT, _shutdown)
         for _name in ("SIGTERM", "SIGBREAK"):
@@ -401,6 +401,36 @@ def _run_prod(*, no_open: bool = False, rebuild: bool = False) -> None:
                     signal.signal(_sig, _shutdown)
 
     server.run()
+    if os.name == "nt":
+        # uvicorn finished, but a normal interpreter exit can still freeze
+        # (see _hard_exit) and keep the terminal stuck.
+        _hard_exit()
+
+
+def _hard_exit() -> None:
+    """End this process right now, even on Windows.
+
+    os._exit() still runs every loaded DLL's detach routine, and on Windows a
+    camera driver (DirectShow, used by the camera previews and recording) or
+    CUDA can block there -- LeLab then printed "Shutting down LeLab..." and
+    froze with the terminal locked. TerminateProcess skips those routines.
+    """
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        # Declared types matter: with ctypes' defaults the HANDLE gets passed
+        # as a 32-bit int, Windows sees an invalid handle, the call fails,
+        # and we'd fall through to the os._exit() that hangs.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), 0)
+        # Still here? Have Windows end us from outside.
+        with contextlib.suppress(Exception):
+            subprocess.run(["taskkill", "/F", "/PID", str(os.getpid())], capture_output=True, timeout=10)
+    os._exit(0)
 
 
 def _run_dev(*, no_open: bool = False) -> None:

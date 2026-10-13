@@ -46,6 +46,13 @@ class TrainingRequest(BaseModel):
     # which policy type it is.
     policy_type: str = "act"
     policy_path: str | None = None
+    # Weights-only starting point for a --policy.type run (pi0.5 starts from
+    # PI05_BASE this way). Unlike policy_path, the camera / feature names then
+    # come from the dataset, so no --rename_map is needed.
+    policy_pretrained_path: str | None = None
+    # pi0.5: freeze the vision-language part and train only the action expert.
+    # Needed to fit a ~16 GB GPU; None = local runs True, cloud runs False.
+    policy_train_expert_only: bool | None = None
 
     # Core training parameters
     steps: int = 10000
@@ -161,6 +168,41 @@ def camera_rename_map(request: TrainingRequest) -> dict[str, str]:
     return dict(zip(dataset_cams, policy_cams, strict=False))
 
 
+PI05_BASE = "lerobot/pi05_base"
+# pi0.5 reads the task sentence with this gated tokenizer: the Hugging Face
+# account must have accepted its license.
+PI05_TOKENIZER_REPO = "google/paligemma-3b-pt-224"
+
+
+def _require_pi05_ready_if_needed(request: TrainingRequest, is_local_run: bool) -> None:
+    """pi0.5 needs the [pi] extra (local runs) and access to the gated
+    PaliGemma tokenizer (local and cloud: the cloud machine uses this
+    account's token). Fail the request up front with what to do (ValueError
+    -> HTTP 400) instead of crashing minutes into the run."""
+    if request.policy_type != "pi05" or request.policy_path:
+        return
+    if is_local_run:
+        import importlib.util
+
+        missing = [name for name in ("transformers", "scipy") if importlib.util.find_spec(name) is None]
+        if missing:
+            raise ValueError(
+                "pi0.5 training needs extra packages that aren't installed (" + ", ".join(missing) + "). "
+                'In the leLab-main folder run: uv pip install -e ".[pi]" and then restart LeLab.'
+            )
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import GatedRepoError
+
+    try:
+        hf_hub_download(PI05_TOKENIZER_REPO, "config.json")
+    except GatedRepoError as exc:
+        raise ValueError(
+            "pi0.5 needs Google's PaliGemma model, which you have to request access to once. Open "
+            f"https://huggingface.co/{PI05_TOKENIZER_REPO} while logged in to the same Hugging Face account "
+            "as LeLab, accept the license, wait for access to be granted, then try again."
+        ) from exc
+
+
 def _require_smolvla_extra_if_needed(request: TrainingRequest) -> None:
     """SmolVLA's dependencies (transformers etc.) are an optional extra, so a
     normal install doesn't download them. Fail the request up front with the
@@ -202,6 +244,17 @@ def _require_recorded_episodes(request: TrainingRequest) -> None:
         )
 
 
+def _cloud_repo_placeholder() -> str:
+    """A valid <user>/<name> model repo id for the submit-time check."""
+    from datetime import datetime
+
+    from .utils.hf_auth import cached_whoami
+
+    info = cached_whoami() or {}
+    user = info.get("name") or "lelab"
+    return f"{user}/train_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+
+
 def build_training_command(
     request: TrainingRequest,
     output_dir: str,
@@ -220,7 +273,11 @@ def build_training_command(
     PATH lookup picks up a different env (uv tool venv, miniforge3 base, etc.)
     that lacks lerobot.
     """
-    cmd: list[str] = [python_executable, "-m", "lerobot.scripts.lerobot_train"]
+    is_cloud_run = job_target is not None and job_target.runner == "hf_cloud"
+    # Cloud runs go through lelab.cloud_submit, which wraps lerobot-train with
+    # fixes for submitting --policy.path runs from Windows (see that module).
+    entry = "lelab.cloud_submit" if is_cloud_run else "lerobot.scripts.lerobot_train"
+    cmd: list[str] = [python_executable, "-m", entry]
 
     # Dataset
     cmd.extend(["--dataset.repo_id", request.dataset_repo_id])
@@ -247,6 +304,7 @@ def build_training_command(
     if is_local_run:
         _require_smolvla_extra_if_needed(request)
         _require_recorded_episodes(request)
+    _require_pi05_ready_if_needed(request, is_local_run)
     if request.policy_path:
         policy_path = request.policy_path
         if sys.platform == "win32" and is_local_run and not Path(policy_path).is_dir():
@@ -261,11 +319,42 @@ def build_training_command(
         # Must be the single "--policy.path=<x>" token: lerobot pre-parses it
         # (parser.get_path_arg) and argparse rejects the space-separated form.
         cmd.append(f"--policy.path={policy_path}")
+        if not is_local_run and not request.resume:
+            # lerobot only names the cloud model repo itself for --policy.type
+            # runs; for --policy.path it rejects the submit ("save_checkpoint_to_hub
+            # requires --policy.repo_id"). Any valid name gets it through --
+            # lerobot renames the repo to <user>/<job name>_<time> when staging.
+            cmd.append(f"--policy.repo_id={_cloud_repo_placeholder()}")
         rename_map = camera_rename_map(request)
         if rename_map:
             cmd.append(f"--rename_map={json.dumps(rename_map)}")
     else:
         cmd.extend(["--policy.type", request.policy_type])
+        if request.policy_pretrained_path:
+            pretrained = request.policy_pretrained_path
+            if sys.platform == "win32" and is_local_run and not Path(pretrained).is_dir():
+                # Same Windows Hub-id-as-Path problem as --policy.path above.
+                from huggingface_hub import snapshot_download
+
+                pretrained = snapshot_download(repo_id=pretrained, repo_type="model")
+            cmd.append(f"--policy.pretrained_path={pretrained}")
+        if request.policy_type == "pi05":
+            # Recommended pi0.5 fine-tuning settings (LeRobot docs). Mean/std
+            # normalization: the default QUANTILES mode needs q01/q99 stats our
+            # recorded datasets don't have.
+            cmd.append(
+                '--policy.normalization_mapping={"ACTION": "MEAN_STD", "STATE": "MEAN_STD", "VISUAL": "IDENTITY"}'
+            )
+            cmd.append("--policy.gradient_checkpointing=true")
+            cmd.append("--policy.dtype=bfloat16")
+            # The whole 3B model needs ~80 GB to fine-tune; on a local ~16 GB GPU
+            # only the action expert is trained (the docs' lower-memory option).
+            expert_only = request.policy_train_expert_only
+            if expert_only is None:
+                expert_only = is_local_run
+            if expert_only:
+                cmd.append("--policy.train_expert_only=true")
+                cmd.append("--policy.freeze_vision_encoder=true")
         if request.policy_type == "smolvla":
             # "From scratch" for SmolVLA means a fresh action expert on top of
             # the PRETRAINED SmolVLM backbone. lerobot's own default here is

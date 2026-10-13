@@ -148,7 +148,14 @@ def _make_locally_loadable(policy_path: str) -> str:
     ``dtype``), and draccus refuses the whole file: "The fields `dtype` are
     not valid for ACTConfig". Such fields are dropped in a copy (under
     HF_LEROBOT_HOME/compat_policies) so the downloaded original stays intact.
-    Returns policy_path unchanged when nothing needs dropping.
+
+    Newer lerobot also saves SmolVLA's text tokenizer inside the model folder
+    and refers to it by the bare relative name "tokenizer"; this lerobot
+    treats that as a Hub model id and fails ("tokenizer is not a local folder
+    and is not a valid model identifier"). In the copy, such a reference is
+    pointed at the copied folder's absolute path.
+
+    Returns policy_path unchanged when nothing needs changing.
     """
     import dataclasses
     import hashlib
@@ -166,7 +173,8 @@ def _make_locally_loadable(policy_path: str) -> str:
         return policy_path
     known = {field.name for field in dataclasses.fields(config_cls)}
     unknown = sorted(key for key in cfg if key != "type" and key not in known)
-    if not unknown:
+    relative_tokenizer = _relative_tokenizer_steps(policy_path)
+    if not unknown and not relative_tokenizer:
         return policy_path
 
     digest = hashlib.sha1(str(Path(policy_path).resolve()).encode("utf-8")).hexdigest()[:16]
@@ -174,17 +182,49 @@ def _make_locally_loadable(policy_path: str) -> str:
     if compat_dir.exists():
         shutil.rmtree(compat_dir)
     shutil.copytree(policy_path, compat_dir)
-    for key in unknown:
-        cfg.pop(key, None)
-    with open(compat_dir / "config.json", "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=4)
+    if unknown:
+        for key in unknown:
+            cfg.pop(key, None)
+        with open(compat_dir / "config.json", "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=4)
+    for processor_file in relative_tokenizer:
+        path = compat_dir / processor_file
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for step in data.get("steps", []):
+            step_cfg = step.get("config") or {}
+            name = step_cfg.get("tokenizer_name")
+            if isinstance(name, str) and (compat_dir / name).is_dir():
+                step_cfg["tokenizer_name"] = (compat_dir / name).as_posix()
+        path.write_text(json.dumps(data, indent=4), encoding="utf-8")
     logger.warning(
-        "Policy config has fields this lerobot doesn't know (%s) -- probably trained with a newer lerobot "
-        "(e.g. on Hugging Face cloud). Running a copy without them: %s",
-        ", ".join(unknown),
+        "Policy was saved by a newer lerobot (e.g. on Hugging Face cloud); running an adjusted copy "
+        "(dropped config fields: %s; tokenizer path fixed in: %s): %s",
+        ", ".join(unknown) or "none",
+        ", ".join(relative_tokenizer) or "none",
         compat_dir,
     )
     return str(compat_dir)
+
+
+def _relative_tokenizer_steps(policy_path: str) -> list[str]:
+    """Processor files whose tokenizer step names a folder inside the model
+    directory (e.g. "tokenizer") instead of a Hub id or absolute path."""
+    found = []
+    for processor_file in sorted(Path(policy_path).glob("policy_*processor.json")):
+        try:
+            data = json.loads(processor_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for step in data.get("steps", []):
+            name = (step.get("config") or {}).get("tokenizer_name")
+            if (
+                isinstance(name, str)
+                and not Path(name).is_absolute()
+                and (Path(policy_path) / name).is_dir()
+            ):
+                found.append(processor_file.name)
+                break
+    return found
 
 
 def _read_policy_config(policy_path: str) -> dict[str, Any]:
@@ -305,31 +345,41 @@ def _friendly_hint(error_text: str | None) -> str | None:
     if not error_text:
         return None
     low = error_text.lower()
+    if "failed to open opencvcamera" in low:
+        # Seen with two USB cameras behind one hub chain: each reserves a large
+        # share of the USB 2.0 link at full size, so the second can't open
+        # (previews still work, being small).
+        return (
+            "A camera couldn't be opened. If both cameras are plugged into the same USB hub, there isn't "
+            "enough room on it for both at full size. Plug one camera straight into the computer (a port "
+            "on the back, or a USB-C port with an adapter), then try again. Also check that no other "
+            "program is using the camera."
+        )
     if "overload" in low or "torque_enable" in low:
         return (
-            "A motor overloaded — usually the gripper holding an object too hard. Release the object / "
-            "open the gripper and power-cycle the arm before trying again."
+            "A motor overloaded, usually the gripper holding an object too hard. Release the object or "
+            "open the gripper, then turn the arm's power off and on before trying again."
         )
     if "missing motor ids" in low or "motor check failed" in low:
         return (
-            "A follower motor isn't responding (often the gripper, id 6). If a skill was holding an object "
-            "it likely overloaded — remove it, power-cycle the arm, then try teleoperation first."
+            "A motor on the arm isn't responding (often the gripper, id 6). If it was holding an object it "
+            "probably overloaded. Remove the object, turn the arm's power off and on, then try arm control first."
         )
     if "could not connect" in low or "failed to connect" in low or "not connected" in low:
-        return "Couldn't connect to the arm — make sure it's plugged in, powered on, and on the right port."
+        return "Couldn't connect to the arm. Make sure it's plugged in, powered on, and on the right port."
     if "frame is too old" in low or "no frame" in low or "frame timeout" in low:
         return (
-            "A camera can't keep up — frames are arriving too slowly. Lower its resolution/FPS, "
-            "set FOURCC=MJPG, and close other heavy apps, then try again."
+            "A camera can't keep up: its frames arrive too slowly. Close other heavy apps, and if both "
+            "cameras share a USB hub, plug one straight into the computer, then try again."
         )
     if "failed to set capture_" in low or "actual_width" in low or "actual_height" in low:
-        return "A camera doesn't support the configured resolution — open camera settings and click Auto."
+        return "A camera doesn't support the size it was asked for. Check the camera settings, then try again."
     if "permission" in low and ("port" in low or "com" in low):
         return "Couldn't open the serial port, close anything else using it, or run `lelab-gamepad --stop`."
     if "relative-action" in low or "relative chunk actions" in low:
         return (
             "This policy was trained with relative actions and needs RTC (chunked) inference. "
-            "Update lelab and try again — recent versions enable that automatically."
+            "Update LeLab and try again. Recent versions turn that on automatically."
         )
     return None
 
@@ -414,7 +464,16 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             *_rollout_inference_args(policy_path),
         ]
         if request.cameras:
-            cmd.append(f"--robot.cameras={_format_cameras_arg(request.cameras)}")
+            # Open the cameras the way recording does (record._platform_backend:
+            # DirectShow on Windows). Left to OpenCV's own choice, the rollout
+            # picked another camera system whose numbering can differ from the
+            # previews/recording and which failed on the second of two
+            # cameras behind one USB hub ("Failed to open OpenCVCamera(0)").
+            from .record import _platform_backend
+
+            backend = int(_platform_backend())
+            cameras = {name: {"backend": backend, **cfg} for name, cfg in request.cameras.items()}
+            cmd.append(f"--robot.cameras={_format_cameras_arg(cameras)}")
             rename_map = _rollout_camera_rename_map(policy_path, request.cameras)
             if rename_map:
                 cmd.append(f"--rename_map={json.dumps(rename_map)}")
@@ -506,9 +565,41 @@ def handle_stop_inference() -> dict[str, Any]:
     return {"success": True, "message": "Inference stopped"}
 
 
+def _setup_crashed(log_path: str | None) -> bool:
+    """True when the rollout's log shows a Python traceback."""
+    if not log_path:
+        return False
+    try:
+        with open(log_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 64 * 1024))
+            return b"Traceback (most recent call last)" in fh.read()
+    except OSError:
+        return False
+
+
 def handle_inference_status() -> dict[str, Any]:
     global inference_active, _inference_proc, _inference_started_at
     global _inference_rollout_started_at, _inference_meta
+
+    # A rollout that crashed during setup (e.g. "Failed to open
+    # OpenCVCamera(0)" because something still held the camera) can print its
+    # traceback and then never exit -- leftover threads keep the process
+    # alive -- so the UI sat on "Loading the AI..." for hours. Before the arm
+    # is ever driven, a traceback means the run is over: end the process so
+    # the normal exit handling below reports the error.
+    with _state_lock:
+        proc = _inference_proc
+        log_path = _inference_meta.get("log_path")
+        rollout_started = _inference_rollout_started_at is not None
+    if proc is not None and proc.poll() is None and not rollout_started and _setup_crashed(log_path):
+        logger.warning("Inference crashed during setup but didn't exit -- ending it (pid=%s)", proc.pid)
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     # Finalise state lazily if the subprocess died on its own.
     with _state_lock:

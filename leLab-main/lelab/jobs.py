@@ -107,6 +107,22 @@ class JobCheckpoint(BaseModel):
     ref: str
 
 
+_LOG_TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+
+def _log_line_time(message: str, received_at: float) -> float:
+    """When a log line was written: lerobot prefixes its lines with
+    'INFO 2026-10-09 00:00:55 ...'. Cloud logs can reach LeLab in bursts, so
+    the line's own time is better than when LeLab received it."""
+    # The step line often follows a tqdm bar on the same line
+    # ("Training: ...step/s]INFO 2026-... step:19K"), so take the last stamp.
+    stamps = _LOG_TIME_RE.findall(message)
+    if stamps:
+        with contextlib.suppress(ValueError):
+            return datetime.strptime(stamps[-1], "%Y-%m-%d %H:%M:%S").timestamp()
+    return received_at
+
+
 class MetricsHistoryPoint(BaseModel):
     """One (step, metrics) sample reconstructed from a job's log.jsonl.
 
@@ -119,6 +135,10 @@ class MetricsHistoryPoint(BaseModel):
     loss: float | None = None
     lr: float | None = None
     grad_norm: float | None = None
+    # Seconds when the step was logged (from the log line's own timestamp,
+    # else when LeLab received it). Only differences between points are
+    # meaningful: a cloud run logs in the cloud machine's clock.
+    t: float | None = None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1012,7 +1032,9 @@ class JobRegistry:
         if not path.exists():
             return []
         out: list[LogLine] = []
-        with path.open() as f:
+        # log.jsonl is UTF-8 (tqdm bars etc.); Windows' default cp1252 can't
+        # decode it and the whole read used to fail with a 500.
+        with path.open(encoding="utf-8", errors="replace") as f:
             for raw in f:
                 raw = raw.strip()
                 if not raw:
@@ -1037,7 +1059,9 @@ class JobRegistry:
         if not path.exists():
             return []
         points: list[MetricsHistoryPoint] = []
-        with path.open() as f:
+        # log.jsonl is UTF-8 (tqdm bars etc.); Windows' default cp1252 can't
+        # decode it and the whole read used to fail with a 500.
+        with path.open(encoding="utf-8", errors="replace") as f:
             for raw in f:
                 raw = raw.strip()
                 if not raw:
@@ -1061,6 +1085,7 @@ class JobRegistry:
                     loss=fresh.current_loss,
                     lr=fresh.current_lr,
                     grad_norm=fresh.grad_norm,
+                    t=_log_line_time(msg, log_line.timestamp),
                 )
                 # Dedupe by step: overwrite on consecutive same-step lines.
                 if points and points[-1].step == point.step:

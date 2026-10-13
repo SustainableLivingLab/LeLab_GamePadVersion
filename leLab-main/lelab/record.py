@@ -62,7 +62,20 @@ recording_config = None  # Store recording configuration
 recording_start_time = None  # Track when recording started
 session_end_elapsed_seconds = None  # Final session duration after the run ends
 current_episode = 1  # Track current episode number
-saved_episodes = 0  # Track how many episodes have been saved
+saved_episodes = 0  # Track how many episodes have been saved (kept ones only)
+# Dataset episode indices saved this session, in recording order, minus the
+# ones the user deleted (see handle_delete_episode). Deletions are applied to
+# the files when the session ends -- lerobot can only edit a finalized dataset.
+kept_episode_indices: list[int] = []
+deleted_episode_indices: set[int] = set()
+# Guards the episode counters above between the recording thread and the
+# delete request.
+episode_lock = threading.Lock()
+# False from the start of a session until its cameras are disconnected again.
+# Camera previews (camera_preview.py) are only refused while this is False --
+# not for the whole session, which also covers finalizing and the Hub upload
+# (minutes) with the cameras already free.
+cameras_released = True
 current_phase = "preparing"  # Track current phase: "preparing", "recording", "resetting", "completed"
 phase_start_time = None  # Track when current phase started
 last_recording_info: dict[str, Any] | None = (
@@ -343,8 +356,11 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
                 saved_episodes, \
                 last_recording_info
             recording_start_time = time.time()
-            current_episode = 1
-            saved_episodes = 0
+            with episode_lock:
+                current_episode = 1
+                saved_episodes = 0
+                kept_episode_indices.clear()
+                deleted_episode_indices.clear()
 
             try:
                 logger.info(
@@ -364,17 +380,21 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
                     time.sleep(2.0)
 
                 dataset = record_with_web_events(record_config, recording_events)
-                logger.info(f"Recording completed successfully. Dataset has {dataset.num_episodes} episodes")
-                last_recording_info = {
-                    "success": True,
-                    "dataset_repo_id": request.dataset_repo_id,
-                    "num_episodes": dataset.num_episodes,
-                    "single_task": request.single_task,
-                    "fps": dataset.fps,
-                    "features": list(dataset.features.keys()),
-                    "total_frames": dataset.num_frames,
-                    "robot_type": getattr(dataset.meta, "robot_type", "Unknown robot"),
-                }
+                if dataset is None:
+                    logger.info("Recording completed -- every episode was deleted, nothing kept")
+                    last_recording_info = None
+                else:
+                    logger.info(f"Recording completed successfully. Dataset has {dataset.num_episodes} episodes")
+                    last_recording_info = {
+                        "success": True,
+                        "dataset_repo_id": request.dataset_repo_id,
+                        "num_episodes": dataset.num_episodes,
+                        "single_task": request.single_task,
+                        "fps": dataset.fps,
+                        "features": list(dataset.features.keys()),
+                        "total_frames": dataset.num_frames,
+                        "robot_type": getattr(dataset.meta, "robot_type", "Unknown robot"),
+                    }
             except Exception as e:
                 # lerobot's init_logging() installs a root formatter that only
                 # renders the message, so logger.exception() would drop the
@@ -455,6 +475,38 @@ def handle_exit_early() -> dict[str, Any]:
         "current_phase": current_phase,
         "events_state": dict(recording_events),
     }
+
+
+def handle_delete_episode(episode: int) -> dict[str, Any]:
+    """Delete an already-saved episode of the running session (1-based, as
+    shown: episode 3 = the third kept one). Later episodes move up one, and the
+    session records one more to still reach its target. The files are edited
+    when the session ends (see _apply_deleted_episodes)."""
+    global saved_episodes, current_episode
+
+    if not recording_active or recording_events is None:
+        return {"success": False, "message": "No recording session is active"}
+    if current_phase not in ("recording", "resetting"):
+        return {"success": False, "message": "Episodes can only be deleted while recording or resetting"}
+    with episode_lock:
+        if not 1 <= episode <= len(kept_episode_indices):
+            return {"success": False, "message": f"Episode {episode} hasn't been saved (yet)"}
+        index = kept_episode_indices.pop(episode - 1)
+        deleted_episode_indices.add(index)
+        saved_episodes -= 1
+        current_episode -= 1
+    logger.info("🗑️ Episode %d (dataset index %d) marked for deletion", episode, index)
+    return {"success": True, "message": f"Episode {episode} deleted", "saved_episodes": saved_episodes}
+
+
+def _gamepad_recording_command(command: str) -> None:
+    """A recording command pressed on the gamepad (see gamepad_mapping.py)."""
+    if command == "end_episode" and current_phase in ("recording", "resetting"):
+        logger.info("🎮 End episode pressed on the gamepad (phase: %s)", current_phase)
+        handle_exit_early()
+    elif command == "rerecord_episode" and current_phase == "recording":
+        logger.info("🎮 Re-record episode pressed on the gamepad")
+        handle_rerecord_episode()
 
 
 def handle_rerecord_episode() -> dict[str, Any]:
@@ -538,7 +590,8 @@ def handle_recording_status() -> dict[str, Any]:
     if recording_active and recording_config:
         status["current_episode"] = current_episode
         status["total_episodes"] = recording_config.num_episodes
-        status["saved_episodes"] = saved_episodes  # Track completed episodes
+        status["saved_episodes"] = saved_episodes  # Track completed (kept) episodes
+        status["deleted_episodes"] = len(deleted_episode_indices)
         # Drives whether the frontend shows a countdown/progress bar or just
         # an elapsed-time readout. Deliberately not inferred from
         # phase_time_limit_s's magnitude (which is UNLIMITED_TIME_S, an
@@ -749,6 +802,43 @@ def handle_upload_dataset(request: UploadRequest) -> dict[str, Any]:
         return {"success": False, "message": f"Failed to upload dataset: {str(e)}"}
 
 
+def _apply_deleted_episodes(dataset, deleted: list[int]):
+    """Remove the episodes deleted during the session from the finalized
+    dataset on disk, renumbering the rest. lerobot's delete_episodes writes an
+    edited copy; it replaces the original in place. Returns the edited
+    dataset, or None when every episode was deleted (the dataset is removed)."""
+    from pathlib import Path
+
+    from lerobot.datasets import LeRobotDataset
+    from lerobot.datasets.dataset_tools import delete_episodes
+
+    root = Path(dataset.root)
+    repo_id = dataset.repo_id
+    total = dataset.meta.total_episodes
+    deleted = [index for index in deleted if 0 <= index < total]
+    if not deleted:
+        return dataset
+    if len(deleted) >= total:
+        logger.info("🗑️ Every episode was deleted -- removing dataset %s", repo_id)
+        shutil.rmtree(root, ignore_errors=True)
+        return None
+
+    logger.info("🗑️ Removing %d deleted episode(s) from %s: %s", len(deleted), repo_id, deleted)
+    source = LeRobotDataset(repo_id, root=root)
+    edited_root = root.parent / f"{root.name}__edited"
+    old_root = root.parent / f"{root.name}__before_delete"
+    for leftover in (edited_root, old_root):
+        shutil.rmtree(leftover, ignore_errors=True)
+    delete_episodes(source, episode_indices=deleted, output_dir=edited_root, repo_id=repo_id)
+    del source
+    root.rename(old_root)
+    edited_root.rename(root)
+    shutil.rmtree(old_root, ignore_errors=True)
+    edited = LeRobotDataset(repo_id, root=root)
+    logger.info("✅ Dataset now has %d episodes", edited.num_episodes)
+    return edited
+
+
 def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDataset:
     """
     Implement recording with phase tracking - exactly mirrors original record() function behavior
@@ -768,6 +858,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
     from lerobot.utils.utils import log_say
 
     global current_phase, phase_start_time, current_episode, saved_episodes, current_robot, current_teleop
+    global cameras_released
 
     robot = make_robot_from_config(cfg.robot)
     if isinstance(cfg.teleop, GamepadSO101TeleopConfig):
@@ -836,6 +927,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
     try:
         try:
             logger.info("🔧 ROBOT CONNECTION: Attempting to connect robot...")
+            cameras_released = False
             check_plugged_in_device(robot.bus, "arm", logger)
             connect_bus_with_fault_recovery(robot.bus, logger)
             # One glitched read would otherwise end the whole recording.
@@ -849,6 +941,9 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
             try:
                 logger.info("🔧 TELEOP CONNECTION: Attempting to connect gamepad...")
                 teleop.connect()
+                # End / re-record episode from the controller (when mapped in
+                # the K12 lessons' Reconfigure): same as the page's buttons.
+                teleop.set_command_handler(_gamepad_recording_command)
                 logger.info("✅ TELEOP CONNECTION: Gamepad connected successfully")
             except Exception as e:
                 logger.error(f"❌ TELEOP CONNECTION: Failed to connect gamepad: {e}")
@@ -942,8 +1037,10 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
                 if dataset.has_pending_frames():
                     logger.info(f"🛑 Stop pressed mid-episode -- saving episode {current_episode}")
                     dataset.save_episode()
-                    saved_episodes += 1
-                    current_episode += 1
+                    with episode_lock:
+                        kept_episode_indices.append(dataset.meta.total_episodes - 1)
+                        saved_episodes += 1
+                        current_episode += 1
                 else:
                     logger.info("🛑 Stop pressed before any frames were recorded -- nothing to save")
                     dataset.clear_episode_buffer()
@@ -1018,8 +1115,10 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
             logger.info(f"✅ Episode {current_episode} saved successfully")
 
             # Increment episode counters after successful save
-            saved_episodes += 1
-            current_episode += 1
+            with episode_lock:
+                kept_episode_indices.append(dataset.meta.total_episodes - 1)
+                saved_episodes += 1
+                current_episode += 1
 
             # Check if we should stop recording
             if web_events["stop_recording"]:
@@ -1095,11 +1194,16 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
             # device busy and block the next recording session (see issue #50).
             # Nested so a failed finalize can't strand the hardware.
             safe_disconnect_device(robot, logger, context="recording cleanup")
+            cameras_released = True
             if teleop:
                 safe_disconnect_device(teleop, logger, context="recording cleanup")
 
+    if deleted_episode_indices:
+        current_phase = "saving"
+        dataset = _apply_deleted_episodes(dataset, sorted(deleted_episode_indices))
+
     if cfg.dataset.push_to_hub:
-        if dataset.num_episodes > 0:
+        if dataset is not None and dataset.num_episodes > 0:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
         else:
             logger.warning("No episodes saved — skipping push to hub")

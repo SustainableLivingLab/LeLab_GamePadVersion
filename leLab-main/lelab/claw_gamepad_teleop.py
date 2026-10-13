@@ -16,11 +16,11 @@
 
 `GamepadSO101Teleop` (gamepad_teleop.py) drives all six SO-101 joints and
 hardcodes their names throughout, so it can't be pointed at a one-motor
-"gripper"-only bus. This is the same L2/R2-only slice of that class's
-behavior -- trigger deflection sets gripper velocity, Cross starts/pauses,
-Triangle returns home, Circle quits -- with the five arm joints removed.
-Shares its axis/button constants, deadzone helper, reconnect interval, and
-home-move ramp with gamepad_teleop.py rather than redefining them, and
+"gripper"-only bus. This is the claw-only slice of that class's behavior,
+driven by the same saved controller mapping (gamepad_mapping.py): the
+"M6 open/close" controls set gripper velocity, and the "Start / pause" and
+"Back to start position" controls work as they do for the arm. Shares its
+reconnect interval and home-move ramp with gamepad_teleop.py, and
 mirrors its connect()/get_action()/reconnect structure exactly (see
 GamepadSO101Teleop's own docstrings for why each piece is shaped the way it
 is -- eager connect() on the worker thread for SDL's thread affinity, and a
@@ -39,21 +39,13 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.utils.decorators import check_if_not_connected
 
+from .gamepad_mapping import DEFAULT_MAPPING, InputReader, command_pressed, joint_velocities, load_mapping
 from .gamepad_teleop import (
-    AXIS_L2,
-    AXIS_R2,
-    BUTTON_HOME,
-    BUTTON_QUIT,
-    BUTTON_START_PAUSE,
     FPS,
-    GRIPPER_MAX_PER_S,
-    GRIPPER_SIGN,
     HOME_MOVE_DURATION_S,
     RECONNECT_INTERVAL_S,
     move_to_home,
     open_best_joystick,
-    read_axis,
-    read_button,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,6 +96,7 @@ class ClawGamepadTeleop(Teleoperator):
         # of retrying a slow Joystick() open every single control tick.
         self._gamepad_connected = True
         self._last_reconnect_attempt = 0.0
+        self._mapping: dict[str, str] = dict(DEFAULT_MAPPING)
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -134,6 +127,9 @@ class ClawGamepadTeleop(Teleoperator):
             pygame.event.pump()
         self._joystick = open_best_joystick(pygame, self.config.joystick_index)
         logger.info(f"Gamepad connected: {self._joystick.get_name()}")
+        # Read once per session, like the arm: a new mapping saved in the K12
+        # app's Reconfigure applies from the next Start Control.
+        self._mapping = load_mapping()
 
     @property
     def is_calibrated(self) -> bool:
@@ -198,11 +194,14 @@ class ClawGamepadTeleop(Teleoperator):
         pygame = self._pygame
         try:
             pygame.event.pump()
+            mapping = self._mapping
+            reader = InputReader(self._joystick)
+            # Nothing to press Start/Pause with: run straight away instead of
+            # leaving the claw unable to ever start.
+            if not mapping.get("start_pause") and not self._running:
+                self._running = True
 
-            if read_button(self._joystick, BUTTON_QUIT):
-                self._quit_requested = True
-
-            if read_button(self._joystick, BUTTON_START_PAUSE):
+            if command_pressed(reader, mapping, "start_pause"):
                 if not self._start_pause_held:
                     self._start_pause_held = True
                     self._running = not self._running
@@ -212,7 +211,7 @@ class ClawGamepadTeleop(Teleoperator):
             else:
                 self._start_pause_held = False
 
-            if read_button(self._joystick, BUTTON_HOME):
+            if command_pressed(reader, mapping, "home"):
                 if not self._home_held:
                     self._home_held = True
                     if self._running and self._robot is not None:
@@ -227,9 +226,8 @@ class ClawGamepadTeleop(Teleoperator):
             self._last_tick = now
 
             if self._running:
-                l2 = (read_axis(self._joystick, AXIS_L2, -1.0) + 1.0) / 2.0  # 0 (released) .. 1 (pressed)
-                r2 = (read_axis(self._joystick, AXIS_R2, -1.0) + 1.0) / 2.0
-                gripper_vel = GRIPPER_SIGN * (r2 - l2) * GRIPPER_MAX_PER_S
+                # Only the claw's own actions count here (M6 open / close).
+                gripper_vel = joint_velocities(reader, mapping).get("gripper", 0.0)
                 new_gripper = self._targets["gripper"] + gripper_vel * dt
                 self._targets["gripper"] = max(0.0, min(100.0, new_gripper))
         except Exception as e:

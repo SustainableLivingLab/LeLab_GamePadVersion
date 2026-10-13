@@ -509,6 +509,42 @@ def recording_status():
     return handle_recording_status()
 
 
+class GamepadMappingBody(BaseModel):
+    mapping: dict[str, str | None]
+
+
+@app.get("/gamepad-mapping")
+def get_gamepad_mapping():
+    """The saved control -> action mapping (K12 lessons' Reconfigure), plus the
+    default and the valid action / input names."""
+    from . import gamepad_mapping as gm
+
+    return {
+        "mapping": gm.load_mapping(),
+        "default": gm.DEFAULT_MAPPING,
+        "actions": list(gm.ACTIONS),
+        "inputs": list(gm.INPUTS),
+    }
+
+
+@app.put("/gamepad-mapping")
+def put_gamepad_mapping(body: GamepadMappingBody):
+    """Save a new mapping. Applies from the next Start Control / recording."""
+    from . import gamepad_mapping as gm
+
+    try:
+        return {"success": True, "mapping": gm.save_mapping(body.mapping)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/gamepad-mapping/reset")
+def reset_gamepad_mapping():
+    from . import gamepad_mapping as gm
+
+    return {"success": True, "mapping": gm.reset_mapping()}
+
+
 @app.get("/camera-preview/{index}")
 def camera_preview_feed(index: int):
     """Live low-res MJPEG preview of camera `index` while nothing else uses
@@ -517,7 +553,10 @@ def camera_preview_feed(index: int):
     from . import rollout as _rollout
 
     def blocked() -> bool:
-        return _record.recording_active or _rollout.inference_active
+        # Only while a recording actually holds the cameras: after it
+        # disconnects them it may still be finalizing or uploading for minutes.
+        recording_holds_cameras = _record.recording_active and not _record.cameras_released
+        return recording_holds_cameras or _rollout.inference_active
 
     if blocked():
         raise HTTPException(status_code=409, detail="Cameras are in use by a recording or policy run")
@@ -541,6 +580,16 @@ def camera_feed(cam_key: str):
         _record.camera_feed_frames(cam_key),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+class DeleteEpisodeRequest(BaseModel):
+    episode: int  # 1-based, as shown in the recording status
+
+
+@app.post("/recording-delete-episode")
+def recording_delete_episode(request: DeleteEpisodeRequest):
+    """Delete an already-saved episode of the running recording session."""
+    return _record.handle_delete_episode(request.episode)
 
 
 @app.post("/recording-exit-early")
