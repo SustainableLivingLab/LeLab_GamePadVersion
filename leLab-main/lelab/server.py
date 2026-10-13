@@ -622,16 +622,75 @@ def list_local_datasets_endpoint():
     return handle_list_local_datasets()
 
 
+class DeleteDatasetRequest(BaseModel):
+    dataset_repo_id: str
+    # The copy on this computer (skipped quietly when there is none).
+    delete_local: bool = True
+    # The copy on Hugging Face. Off unless the user explicitly asked for it.
+    delete_hub: bool = False
+
+
+def _delete_hub_dataset(repo_id: str) -> str | None:
+    """Delete a dataset repo from the user's Hugging Face account. Returns an
+    error message, or None on success (also when it was already gone)."""
+    from huggingface_hub.errors import HfHubHTTPError
+
+    info = cached_whoami()
+    if info is None:
+        return "You are not logged in to Hugging Face on this computer."
+    owners = {info.get("name")} | {
+        o.get("name") for o in info.get("orgs", []) or [] if isinstance(o, dict)
+    }
+    # Only the user's own (or their organisations') datasets, never anyone else's.
+    if "/" not in repo_id or repo_id.split("/", 1)[0] not in owners:
+        return "This dataset does not belong to your Hugging Face account, so it can't be deleted from here."
+    try:
+        shared_hf_api().delete_repo(repo_id, repo_type="dataset")
+    except HfHubHTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 404:
+            return None
+        if status in (401, 403):
+            return "Your Hugging Face token is not allowed to delete datasets. It needs write access."
+        logger.error(f"Failed to delete Hub dataset {repo_id}: {e}")
+        return f"Hugging Face refused: {e}"
+    except Exception as e:  # network down, etc.
+        logger.error(f"Failed to delete Hub dataset {repo_id}: {e}")
+        return f"Could not reach Hugging Face: {e}"
+    logger.info(f"Deleted Hub dataset {repo_id}")
+    return None
+
+
 @app.post("/delete-dataset")
-def delete_dataset(request: DatasetInfoRequest):
-    """Remove a recorded dataset directory from local disk."""
+def delete_dataset(request: DeleteDatasetRequest):
+    """Remove a recorded dataset from local disk and, only when asked
+    (delete_hub), from the user's Hugging Face account too."""
+    from pathlib import Path
+
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    repo_id = request.dataset_repo_id
     # Deleting files out from under a recording or a training run crashes it.
     if _record.recording_active:
         return {"success": False, "message": "Stop the recording before deleting a dataset."}
     for job in job_registry.list(limit=1000):
-        if job.state == "running" and job.config.dataset_repo_id == request.dataset_repo_id:
-            return {"success": False, "message": "This dataset is being trained on -- stop training first."}
-    return handle_delete_dataset(request)
+        if job.state == "running" and job.config.dataset_repo_id == repo_id:
+            return {"success": False, "message": "This dataset is being trained on. Stop training first."}
+
+    deleted: list[str] = []
+    local_exists = (Path(HF_LEROBOT_HOME) / repo_id).exists()
+    if request.delete_local and (local_exists or not request.delete_hub):
+        result = handle_delete_dataset(DatasetInfoRequest(dataset_repo_id=repo_id))
+        if not result.get("success"):
+            return result
+        deleted.append("this computer")
+    if request.delete_hub:
+        error = _delete_hub_dataset(repo_id)
+        if error:
+            prefix = "Deleted from this computer, but not from Hugging Face. " if deleted else ""
+            return {"success": False, "message": prefix + error, "deleted_from": deleted}
+        deleted.append("Hugging Face")
+    return {"success": True, "message": f"Deleted {repo_id}", "deleted_from": deleted}
 
 
 # ============================================================================
@@ -823,6 +882,13 @@ def delete_job(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
     except JobNotRunningError as exc:
         raise HTTPException(status_code=409, detail=f"Job {job_id!r} is running; stop it first") from exc
+    except OSError as exc:
+        # Windows: a file in the run folder is still open (e.g. the AI is
+        # running from this model).
+        raise HTTPException(
+            status_code=409,
+            detail=f"Some files of this training are in use and could not be deleted. Stop any AI run and try again. ({exc})",
+        ) from exc
 
 
 @app.get("/jobs/runners/hardware")
