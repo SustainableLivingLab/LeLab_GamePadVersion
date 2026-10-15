@@ -345,6 +345,11 @@ def _friendly_hint(error_text: str | None) -> str | None:
     if not error_text:
         return None
     low = error_text.lower()
+    if _WEIGHTS_NOT_LOADED.decode() in low:
+        return (
+            "The AI's trained weights could not be loaded, so it was stopped before moving the arm. "
+            "Restart LeLab and try again."
+        )
     if "failed to open opencvcamera" in low:
         # Seen with two USB cameras behind one hub chain: each reserves a large
         # share of the USB 2.0 link at full size, so the second can't open
@@ -485,6 +490,13 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        # Windows: a child whose output goes to a file writes in the old
+        # cp1252 charset, and lerobot's pi0/pi0.5 loader prints a check mark
+        # after reading the weights. That print raised, lerobot caught it and
+        # carried on WITHOUT the trained weights (a random model). UTF-8 output
+        # avoids it.
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
         # Feed a single newline into stdin so SOFollower.calibrate()'s
         # `input("Press ENTER to use the calibration file ...")` returns "" and
         # writes the existing calibration to the motors instead of hanging
@@ -565,15 +577,23 @@ def handle_stop_inference() -> dict[str, Any]:
     return {"success": True, "message": "Inference stopped"}
 
 
+# lerobot's pi0 / pi0.5 loaders don't fail when the weights can't be read:
+# they print this and return an untrained (random) model. Never let that
+# drive the arm.
+_WEIGHTS_NOT_LOADED = b"without loading pretrained weights"
+
+
 def _setup_crashed(log_path: str | None) -> bool:
-    """True when the rollout's log shows a Python traceback."""
+    """True when the rollout's log shows a Python traceback, or that the
+    model came up without its trained weights."""
     if not log_path:
         return False
     try:
         with open(log_path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
             fh.seek(max(0, fh.tell() - 64 * 1024))
-            return b"Traceback (most recent call last)" in fh.read()
+            data = fh.read()
+            return b"Traceback (most recent call last)" in data or _WEIGHTS_NOT_LOADED in data
     except OSError:
         return False
 
@@ -618,6 +638,16 @@ def handle_inference_status() -> dict[str, Any]:
             # On failure, surface the real error from the log so the UI doesn't
             # have to send the user digging through the cache.
             error = _extract_error_from_log(finished_meta.get("log_path")) if rc else None
+            hint = _friendly_hint(error)
+            # Windows access violation (0xC0000005) with no Python traceback:
+            # while loading, that is almost always running out of memory (a
+            # large model like pi0.5 needs ~19 GB of RAM to load).
+            if rc in (3221225477, -1073741819) and finished_rollout_started is None:
+                hint = (
+                    "The AI crashed while loading, most likely because the computer ran out of memory. "
+                    "Close other programs (especially browser tabs) and try again. For big models like "
+                    "pi0.5, a larger Windows page file helps."
+                )
             outcome = _classify_outcome(rc, finished_rollout_started is not None, error)
             return {
                 "inference_active": False,
@@ -625,7 +655,7 @@ def handle_inference_status() -> dict[str, Any]:
                 "exit_code": rc,
                 "outcome": outcome,
                 "error": error,
-                "hint": _friendly_hint(error),
+                "hint": hint,
                 "policy_ref": finished_meta.get("policy_ref"),
                 "duration_s": finished_meta.get("duration_s"),
                 "log_path": finished_meta.get("log_path"),

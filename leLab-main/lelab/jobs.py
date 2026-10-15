@@ -286,6 +286,13 @@ class SubprocessJobRunner:
         # block-buffering hides log lines from our parser for many seconds.
         child_env = os.environ.copy()
         child_env["PYTHONUNBUFFERED"] = "1"
+        # Windows: a child whose output goes to a file writes in the old
+        # cp1252 charset, and lerobot's pi0/pi0.5 loader prints a check mark
+        # after reading the weights. That print raised, lerobot caught it and
+        # carried on WITHOUT the trained weights (a random model). UTF-8 output
+        # avoids it.
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
 
         # start_new_session=True puts the child in its own session/process
         # group. Without it, signals sent to the uvicorn worker (e.g. when

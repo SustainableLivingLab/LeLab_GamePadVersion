@@ -631,9 +631,16 @@ class DeleteDatasetRequest(BaseModel):
 
 
 def _delete_hub_dataset(repo_id: str) -> str | None:
-    """Delete a dataset repo from the user's Hugging Face account. Returns an
-    error message, or None on success (also when it was already gone)."""
+    return _delete_hub_repo(repo_id, "dataset")
+
+
+def _delete_hub_repo(repo_id: str, repo_type: str) -> str | None:
+    """Delete a dataset or model repo from the user's Hugging Face account.
+    Returns an error message, or None on success (also when it was already
+    gone)."""
     from huggingface_hub.errors import HfHubHTTPError
+
+    noun = "dataset" if repo_type == "dataset" else "model"
 
     info = cached_whoami()
     if info is None:
@@ -641,23 +648,23 @@ def _delete_hub_dataset(repo_id: str) -> str | None:
     owners = {info.get("name")} | {
         o.get("name") for o in info.get("orgs", []) or [] if isinstance(o, dict)
     }
-    # Only the user's own (or their organisations') datasets, never anyone else's.
+    # Only the user's own (or their organisations') repos, never anyone else's.
     if "/" not in repo_id or repo_id.split("/", 1)[0] not in owners:
-        return "This dataset does not belong to your Hugging Face account, so it can't be deleted from here."
+        return f"This {noun} does not belong to your Hugging Face account, so it can't be deleted from here."
     try:
-        shared_hf_api().delete_repo(repo_id, repo_type="dataset")
+        shared_hf_api().delete_repo(repo_id, repo_type=repo_type)
     except HfHubHTTPError as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
         if status == 404:
             return None
         if status in (401, 403):
-            return "Your Hugging Face token is not allowed to delete datasets. It needs write access."
-        logger.error(f"Failed to delete Hub dataset {repo_id}: {e}")
+            return f"Your Hugging Face token is not allowed to delete {noun}s. It needs write access."
+        logger.error(f"Failed to delete Hub {noun} {repo_id}: {e}")
         return f"Hugging Face refused: {e}"
     except Exception as e:  # network down, etc.
-        logger.error(f"Failed to delete Hub dataset {repo_id}: {e}")
+        logger.error(f"Failed to delete Hub {noun} {repo_id}: {e}")
         return f"Could not reach Hugging Face: {e}"
-    logger.info(f"Deleted Hub dataset {repo_id}")
+    logger.info(f"Deleted Hub {noun} {repo_id}")
     return None
 
 
@@ -875,7 +882,23 @@ def stop_job(job_id: str):
 
 
 @app.delete("/jobs/{job_id}", status_code=204)
-def delete_job(job_id: str):
+def delete_job(job_id: str, delete_hub: bool = False):
+    """Delete a training. With delete_hub, a cloud training's model repo on
+    Hugging Face (its checkpoints) is deleted first; if that fails, nothing
+    is deleted so it can be retried."""
+    if delete_hub:
+        try:
+            record = job_registry.get(job_id)
+        except JobNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
+        if record.state == "running":
+            raise HTTPException(status_code=409, detail=f"Job {job_id!r} is running; stop it first")
+        # Only repos a cloud run of ours created; an imported model may be
+        # someone else's (the ownership check in _delete_hub_repo also guards).
+        if record.runner == "hf_cloud" and record.hf_repo_id:
+            error = _delete_hub_repo(record.hf_repo_id, "model")
+            if error:
+                raise HTTPException(status_code=502, detail=error)
     try:
         job_registry.delete(job_id)
     except JobNotFoundError as exc:
