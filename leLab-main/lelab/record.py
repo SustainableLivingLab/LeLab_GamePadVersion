@@ -674,6 +674,27 @@ def camera_feed_frames(cam_key: str, fps: float = 15.0):
         time.sleep(interval)
 
 
+def _dataset_tasks(meta) -> list[str]:
+    """The task texts recorded in a dataset. This lerobot keeps them in
+    meta.tasks (a table indexed by the task text); there is no
+    meta.single_task, so reading that always gave "Unknown task", and the AI
+    run then got that as its instruction instead of the real task."""
+    tasks = getattr(meta, "tasks", None)
+    try:
+        if hasattr(tasks, "index"):
+            return [str(task) for task in tasks.index]
+        if isinstance(tasks, dict):
+            return [str(task) for task in tasks.values()]
+    except Exception:
+        pass
+    return []
+
+
+def _dataset_task(meta) -> str:
+    tasks = _dataset_tasks(meta)
+    return tasks[0] if tasks else getattr(meta, "single_task", None) or "Unknown task"
+
+
 def handle_get_dataset_info(request: DatasetInfoRequest) -> dict[str, Any]:
     """Return dataset metadata — from the most recent session if it matches,
     otherwise by loading the local LeRobot cache copy."""
@@ -690,7 +711,8 @@ def handle_get_dataset_info(request: DatasetInfoRequest) -> dict[str, Any]:
             "success": True,
             "dataset_repo_id": request.dataset_repo_id,
             "num_episodes": dataset.num_episodes,
-            "single_task": getattr(dataset.meta, "single_task", "Unknown task"),
+            "single_task": _dataset_task(dataset.meta),
+            "tasks": _dataset_tasks(dataset.meta),
             "fps": dataset.fps,
             "features": list(dataset.features.keys()),
             "total_frames": dataset.num_frames,

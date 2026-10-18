@@ -59,6 +59,10 @@ _inference_meta: dict[str, Any] = {}
 # Guards mutations to the globals above; held only for the short critical
 # sections in start/stop/status.
 _state_lock = threading.Lock()
+# Stop pressed while a run is still being prepared (downloading the model,
+# making its compatibility copy): there is no process to stop yet, so the
+# start sequence checks this before launching one.
+_inference_cancel = threading.Event()
 _HUB_REF_RE = re.compile(r"^(?P<repo>[^@]+)@checkpoints/(?P<step_dir>\d+)$")
 _HUB_ROOT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@root$")
 # lerobot prints this once per run, the moment its main control loop is
@@ -440,6 +444,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             }
         # Claim the slot now so a concurrent caller losing the race sees us.
         inference_active = True
+        _inference_cancel.clear()
 
     # Opened partway through setup; the stdout pump thread takes ownership once
     # it starts. Tracked here so a failure before that hand-off can close it
@@ -453,6 +458,11 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         # `calibration_dir / f"{id}.json"`.
         follower_id = setup_follower_calibration_file(request.follower_config)
         policy_path = _make_locally_loadable(_resolve_policy_path(request.policy_ref))
+        if _inference_cancel.is_set():
+            with _state_lock:
+                inference_active = False
+            logger.info("Inference cancelled before it started")
+            return {"success": False, "status_code": 409, "message": "Stopped before the AI started."}
 
         cmd = [
             sys.executable,
@@ -535,6 +545,15 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             inference_active = False
         return {"success": False, "status_code": 500, "message": f"Failed to start inference: {exc}"}
 
+    if _inference_cancel.is_set():
+        # Stop arrived while the process was being launched.
+        proc.kill()
+        proc.wait()
+        with _state_lock:
+            inference_active = False
+        logger.info("Inference cancelled right after launch")
+        return {"success": False, "status_code": 409, "message": "Stopped before the AI started."}
+
     with _state_lock:
         _inference_proc = proc
         _inference_started_at = time.time()
@@ -553,6 +572,10 @@ def handle_stop_inference() -> dict[str, Any]:
     global _inference_rollout_started_at, _inference_meta
 
     with _state_lock:
+        if inference_active and _inference_proc is None:
+            # Still preparing (download / copy): cancel it before it launches.
+            _inference_cancel.set()
+            return {"success": True, "message": "Stopping. The AI will not start."}
         if not inference_active or _inference_proc is None:
             return {"success": False, "status_code": 409, "message": "No inference is active"}
         proc = _inference_proc
