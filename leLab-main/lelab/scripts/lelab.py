@@ -123,11 +123,16 @@ def _find_lelab_pids() -> dict[int, str]:
     me = os.getpid()
     ports = {BACKEND_PORT, FRONTEND_DEV_PORT}
     targets: dict[int, str] = {}
-    for proc in psutil.process_iter(["pid", "cmdline"]):
+    for proc in psutil.process_iter(["pid"]):
         pid = proc.info["pid"]
         if pid == me:
             continue
-        cmdline = " ".join(proc.info.get("cmdline") or [])
+        # Read per process: asking process_iter for cmdline lets one
+        # unreadable process (WinError 87, see below) abort the whole scan.
+        try:
+            cmdline = " ".join(proc.cmdline() or [])
+        except (psutil.Error, OSError):
+            cmdline = ""
         if "lelab.server" in cmdline:
             targets[pid] = "uvicorn (lelab.server)"
             continue
@@ -136,7 +141,10 @@ def _find_lelab_pids() -> dict[int, str]:
                 if Path(proc.cwd()) == PROJECT_ROOT:
                     targets[pid] = "orphaned reload worker"
                     continue
-            except (psutil.AccessDenied, psutil.NoSuchProcess):
+            # OSError: on Windows, reading some processes fails with a raw
+            # "WinError 87 ... (originated from ReadProcessMemory)" instead of
+            # AccessDenied; it used to crash --stop. Skip those processes.
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                 pass
         try:
             get_conns = getattr(proc, "net_connections", None) or proc.connections
@@ -144,7 +152,7 @@ def _find_lelab_pids() -> dict[int, str]:
                 if conn.laddr and conn.laddr.port in ports and conn.status == psutil.CONN_LISTEN:
                     targets[pid] = f"listening on :{conn.laddr.port}"
                     break
-        except (psutil.AccessDenied, psutil.NoSuchProcess):
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
             pass
     return targets
 

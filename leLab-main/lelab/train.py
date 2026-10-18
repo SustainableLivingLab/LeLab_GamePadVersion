@@ -255,6 +255,15 @@ def _cloud_repo_placeholder() -> str:
     return f"{user}/train_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
 
 
+def _short_job_name(name: str, limit: int = 40) -> str:
+    """The job name, cut at a word boundary to at most `limit` characters."""
+    name = name.strip()
+    if len(name) <= limit:
+        return name
+    cut = name[:limit].rsplit(" ", 1)[0].rstrip(" -_")
+    return cut or name[:limit]
+
+
 def build_training_command(
     request: TrainingRequest,
     output_dir: str,
@@ -421,7 +430,9 @@ def build_training_command(
         cmd.extend(["--output_dir", output_dir])
     cmd.extend(["--resume", "true" if request.resume else "false"])
     if request.job_name:
-        cmd.extend(["--job_name", request.job_name])
+        # A cloud run's model repo is named after the job: keep it short (a
+        # whole sentence made local paths too long for Windows).
+        cmd.extend(["--job_name", _short_job_name(request.job_name)])
 
     # W&B
     cmd.extend(["--wandb.enable", "true" if request.wandb_enable else "false"])

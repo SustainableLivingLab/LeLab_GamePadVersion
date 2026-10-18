@@ -547,7 +547,9 @@ def handle_recording_status() -> dict[str, Any]:
         "session_ended": session_ended,  # New field to indicate session completion
         "available_controls": {
             "stop_recording": recording_active,  # ESC key replacement
-            "exit_early": recording_active,  # Right arrow key replacement
+            # Right arrow key replacement; nothing to finish once all
+            # episodes are recorded and the dataset is being saved.
+            "exit_early": recording_active and current_phase in ("recording", "resetting", "preparing"),
             "rerecord_episode": recording_active
             and current_phase == "recording",  # Only during recording phase
         },
@@ -1193,10 +1195,13 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
                     logger.info("🛑 STOP RECORDING requested during reset phase - ending session")
                     break
 
-        # Recording completed
-        current_phase = "completed"
+        # All episodes recorded. The dataset still has to be finished (and
+        # maybe uploaded) before the session really ends, which can take a
+        # while: report "saving" so the app doesn't look stuck on the last
+        # episode. "completed" is set once everything is done.
+        current_phase = "saving"
         phase_start_time = None
-        logger.info("🏁 Recording session completed - all episodes finished")
+        logger.info("🏁 Recording session completed - all episodes finished, saving the dataset")
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
     finally:
@@ -1226,6 +1231,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
 
     if cfg.dataset.push_to_hub:
         if dataset is not None and dataset.num_episodes > 0:
+            current_phase = "uploading"
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
         else:
             logger.warning("No episodes saved — skipping push to hub")

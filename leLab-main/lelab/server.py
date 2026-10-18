@@ -413,6 +413,39 @@ def stop_inference():
     return result
 
 
+class RemoteServerRequest(BaseModel):
+    policy_ref: str
+    flavor: str | None = None
+
+
+@app.post("/remote-server/start")
+def remote_server_start(request: RemoteServerRequest):
+    """Start the cloud GPU that runs a cloud training's checkpoint for the arm."""
+    from . import remote_server
+
+    try:
+        return remote_server.start(request.policy_ref, request.flavor or remote_server.DEFAULT_FLAVOR)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not start the cloud GPU")
+        raise HTTPException(status_code=502, detail=f"Could not start the cloud GPU: {exc}") from exc
+
+
+@app.get("/remote-server/status")
+def remote_server_status():
+    from . import remote_server
+
+    return remote_server.status()
+
+
+@app.post("/remote-server/stop")
+def remote_server_stop():
+    from . import remote_server
+
+    return remote_server.stop()
+
+
 @app.get("/inference-status")
 def inference_status():
     return handle_inference_status()
@@ -648,6 +681,15 @@ def _delete_hub_repo(repo_id: str, repo_type: str) -> str | None:
     owners = {info.get("name")} | {
         o.get("name") for o in info.get("orgs", []) or [] if isinstance(o, dict)
     }
+    # A renamed account keeps redirecting its old name (e.g. a record saved
+    # as "oldname/model"): check and delete under the repo's current name.
+    try:
+        repo_id = shared_hf_api().repo_info(repo_id, repo_type=repo_type).id
+    except HfHubHTTPError as e:
+        if getattr(getattr(e, "response", None), "status_code", None) == 404:
+            return None
+    except Exception:
+        pass
     # Only the user's own (or their organisations') repos, never anyone else's.
     if "/" not in repo_id or repo_id.split("/", 1)[0] not in owners:
         return f"This {noun} does not belong to your Hugging Face account, so it can't be deleted from here."

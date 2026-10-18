@@ -49,6 +49,9 @@ class InferenceRequest(BaseModel):
     task: str = ""
     cameras: dict[str, dict[str, Any]] = {}
     duration_s: int = 60
+    # Run the policy on the cloud GPU (remote_server.py) instead of this
+    # computer; the server must already be started and ready.
+    remote: bool = False
 
 
 inference_active: bool = False
@@ -71,6 +74,134 @@ _HUB_ROOT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@root$")
 # load + bus connect + camera connect setup overhead.
 _ROLLOUT_START_MARKER = "Rollout setup complete"
 
+# The run's steps, shown in the app while it starts ("Download the model:
+# 3.1 of 9.4 GB", "Load the AI: 30 s, last time about 70 s"). Each entry:
+# {"id", "label", "state": pending|active|done, "started", "ended", "detail"}.
+# Moved along by the start sequence and by lines the run prints
+# (_STEP_MARKERS); durations are kept in _TIMINGS_FILE for "last time".
+_run_steps: list[dict[str, Any]] = []
+_run_download: dict[str, Any] = {}
+_STEP_MARKERS = (
+    ("Policy loaded", "load"),  # lerobot rollout: model is on the device
+    ("Robot connected", "connect"),  # both: arm and cameras connected
+    ("Rollout setup complete", "first_plan"),  # cloud: first plan arrived
+    ("Duration limit reached", "run"),  # both: time is up, arm goes home
+)
+
+
+def _timings_file() -> Path:
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    return Path(HF_LEROBOT_HOME) / "lelab_run_timings.json"
+
+
+def _load_timings() -> dict[str, Any]:
+    try:
+        return json.loads(_timings_file().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_step_time(step_id: str, seconds: float) -> None:
+    key = _inference_meta.get("policy_ref") or ""
+    try:
+        timings = _load_timings()
+        timings.setdefault(key, {})[step_id] = round(seconds, 1)
+        _timings_file().write_text(json.dumps(timings, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _init_steps(remote: bool, local_model: bool) -> None:
+    global _run_steps
+    if remote:
+        ids = [
+            ("connect", "Connect the arm and cameras"),
+            ("first_plan", "Get the first plan from the cloud GPU"),
+        ]
+    else:
+        ids = [] if local_model else [("download", "Download the model")]
+        ids += [
+            ("prepare", "Prepare the model for this computer"),
+            ("load", "Load the AI"),
+            ("connect", "Connect the arm and cameras"),
+        ]
+    ids += [("run", "The AI drives the arm"), ("return", "Return to the start position")]
+    _run_steps = [{"id": i, "label": label, "state": "pending", "started": None, "ended": None, "detail": None}
+                  for i, label in ids]
+
+
+def _step(step_id: str) -> dict[str, Any] | None:
+    return next((step for step in _run_steps if step["id"] == step_id), None)
+
+
+def _finish_step(step_id: str) -> None:
+    """Mark a step done (and any earlier ones), and start the next one."""
+    now = time.time()
+    ids = [step["id"] for step in _run_steps]
+    if step_id not in ids:
+        return
+    index = ids.index(step_id)
+    for step in _run_steps[: index + 1]:
+        if step["state"] != "done":
+            if step["started"] is None:
+                step["started"] = now
+            step["state"] = "done"
+            step["ended"] = now
+            if step["id"] in ("load", "connect", "first_plan", "download", "prepare"):
+                _save_step_time(step["id"], now - step["started"])
+    if index + 1 < len(_run_steps) and _run_steps[index + 1]["state"] == "pending":
+        _run_steps[index + 1]["state"] = "active"
+        _run_steps[index + 1]["started"] = now
+
+
+def _start_step(step_id: str) -> None:
+    step = _step(step_id)
+    if step and step["state"] == "pending":
+        step["state"] = "active"
+        step["started"] = time.time()
+
+
+def _steps_payload() -> list[dict[str, Any]]:
+    now = time.time()
+    timings = _load_timings().get(_inference_meta.get("policy_ref") or "", {})
+    out = []
+    for step in _run_steps:
+        item = {"id": step["id"], "label": step["label"], "state": step["state"], "detail": step["detail"]}
+        if step["started"] is not None:
+            item["seconds"] = round((step["ended"] or now) - step["started"], 1)
+        if step["id"] in timings:
+            item["last_seconds"] = timings[step["id"]]
+        if step["id"] == "download" and step["state"] == "active" and _run_download.get("dir"):
+            item["detail"] = _download_detail()
+        out.append(item)
+    return out
+
+
+def _download_detail() -> str | None:
+    total = _run_download.get("total")
+    try:
+        done = sum(f.stat().st_size for f in Path(_run_download["dir"]).rglob("*") if f.is_file())
+    except Exception:
+        return None
+    if total:
+        return f"{done / 1e9:.1f} of {total / 1e9:.1f} GB"
+    return f"{done / 1e9:.1f} GB so far"
+
+
+def _expected_download_bytes(repo_id: str, pattern_prefix: str | None) -> int | None:
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(repo_id, files_metadata=True)
+        return sum(
+            (sibling.size or 0)
+            for sibling in info.siblings
+            if pattern_prefix is None or sibling.rfilename.startswith(pattern_prefix)
+        )
+    except Exception:
+        return None
+
 
 def _pump_stdout(proc: subprocess.Popen, log_handle) -> None:
     """Tee the subprocess's stdout to the log file and watch for the
@@ -87,6 +218,15 @@ def _pump_stdout(proc: subprocess.Popen, log_handle) -> None:
                 log_handle.flush()
             except Exception:
                 pass
+            for marker, step_id in _STEP_MARKERS:
+                if marker in line:
+                    with _state_lock:
+                        # Cloud runs have no "load" step; local runs no
+                        # "first_plan" one (_finish_step ignores those).
+                        if step_id == "first_plan" and not _step("first_plan"):
+                            _finish_step("connect")
+                        else:
+                            _finish_step(step_id)
             if _inference_rollout_started_at is None and _ROLLOUT_START_MARKER in line:
                 _inference_rollout_started_at = time.time()
                 logger.info(
@@ -114,6 +254,21 @@ def _detect_device() -> str:
     return "cpu"
 
 
+def _short_model_dir(repo_id: str) -> str:
+    """A short local folder for a downloaded model.
+
+    Hugging Face's own cache path repeats the repo name and adds a 40-letter
+    snapshot id, so with a long repo name (e.g. a whole task sentence as the
+    job name) files like policy_postprocessor.json went past Windows' 260
+    character path limit and silently failed to download."""
+    import hashlib
+
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    digest = hashlib.sha1(repo_id.encode("utf-8")).hexdigest()[:12]
+    return str(Path(HF_LEROBOT_HOME) / "models" / digest)
+
+
 def _resolve_policy_path(policy_ref: str) -> str:
     """Turn a checkpoints API ref into a local path that lerobot accepts.
 
@@ -136,11 +291,12 @@ def _resolve_policy_path(policy_ref: str) -> str:
             repo_id=repo_id,
             repo_type="model",
             allow_patterns=[f"checkpoints/{step_dir}/pretrained_model/*"],
+            local_dir=_short_model_dir(repo_id),
         )
         return str(Path(local_root) / "checkpoints" / step_dir / "pretrained_model")
     m = _HUB_ROOT_REF_RE.match(policy_ref)
     if m:
-        return snapshot_download(repo_id=m.group("repo"), repo_type="model")
+        return snapshot_download(repo_id=m.group("repo"), repo_type="model", local_dir=_short_model_dir(m.group("repo")))
     raise ValueError(f"Unrecognised policy ref: {policy_ref!r}")
 
 
@@ -445,6 +601,9 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         # Claim the slot now so a concurrent caller losing the race sees us.
         inference_active = True
         _inference_cancel.clear()
+        _inference_meta = {"policy_ref": request.policy_ref, "duration_s": request.duration_s}
+        _init_steps(request.remote, Path(request.policy_ref).is_dir())
+        _run_download.clear()
 
     # Opened partway through setup; the stdout pump thread takes ownership once
     # it starts. Tracked here so a failure before that hand-off can close it
@@ -457,27 +616,62 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         # because lerobot appends `.json` itself when constructing
         # `calibration_dir / f"{id}.json"`.
         follower_id = setup_follower_calibration_file(request.follower_config)
-        policy_path = _make_locally_loadable(_resolve_policy_path(request.policy_ref))
+        if request.remote:
+            from . import remote_server
+
+            server_url = remote_server.ready_url(request.policy_ref)
+            policy_path = None
+            with _state_lock:
+                _start_step("connect")
+        else:
+            if _step("download"):
+                m = _HUB_REF_RE.match(request.policy_ref) or _HUB_ROOT_REF_RE.match(request.policy_ref)
+                if m:
+                    repo_id = m.group("repo")
+                    prefix = (
+                        f"checkpoints/{m.group('step_dir')}/pretrained_model/" if "step_dir" in m.groupdict() else None
+                    )
+                    _run_download.update(
+                        dir=str(Path(_short_model_dir(repo_id)) / (prefix or "")),
+                        total=_expected_download_bytes(repo_id, prefix),
+                    )
+                with _state_lock:
+                    _start_step("download")
+            resolved = _resolve_policy_path(request.policy_ref)
+            with _state_lock:
+                _finish_step("download") if _step("download") else _start_step("prepare")
+            policy_path = _make_locally_loadable(resolved)
+            with _state_lock:
+                _finish_step("prepare")
+                load = _step("load")
+                if load is not None:
+                    load["label"] = "Load the AI into the GPU" if _detect_device() == "cuda" else "Load the AI"
         if _inference_cancel.is_set():
             with _state_lock:
                 inference_active = False
             logger.info("Inference cancelled before it started")
             return {"success": False, "status_code": 409, "message": "Stopped before the AI started."}
 
-        cmd = [
-            sys.executable,
-            "-m",
-            "lerobot.scripts.lerobot_rollout",
-            "--strategy.type=base",
-            f"--policy.path={policy_path}",
-            f"--policy.device={_detect_device()}",
+        robot_args = [
             "--robot.type=so101_follower",
             f"--robot.port={request.follower_port}",
             f"--robot.id={follower_id}",
             f"--task={request.task}",
             f"--duration={request.duration_s}",
-            *_rollout_inference_args(policy_path),
         ]
+        if request.remote:
+            cmd = [sys.executable, "-m", "lelab.remote_rollout", f"--server_url={server_url}", *robot_args]
+        else:
+            cmd = [
+                sys.executable,
+                "-m",
+                "lerobot.scripts.lerobot_rollout",
+                "--strategy.type=base",
+                f"--policy.path={policy_path}",
+                f"--policy.device={_detect_device()}",
+                *robot_args,
+                *_rollout_inference_args(policy_path),
+            ]
         if request.cameras:
             # Open the cameras the way recording does (record._platform_backend:
             # DirectShow on Windows). Left to OpenCV's own choice, the rollout
@@ -489,7 +683,8 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             backend = int(_platform_backend())
             cameras = {name: {"backend": backend, **cfg} for name, cfg in request.cameras.items()}
             cmd.append(f"--robot.cameras={_format_cameras_arg(cameras)}")
-            rename_map = _rollout_camera_rename_map(policy_path, request.cameras)
+            # (The cloud server pairs camera names itself.)
+            rename_map = _rollout_camera_rename_map(policy_path, request.cameras) if policy_path else {}
             if rename_map:
                 cmd.append(f"--rename_map={json.dumps(rename_map)}")
 
@@ -534,6 +729,13 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             daemon=True,
         ).start()
         log_handle = None  # pump thread owns and closes it from here on
+    except ValueError as exc:
+        # A plain reason (e.g. the cloud GPU isn't ready yet).
+        if log_handle is not None:
+            log_handle.close()
+        with _state_lock:
+            inference_active = False
+        return {"success": False, "status_code": 409, "message": str(exc)}
     except Exception as exc:
         logger.exception("Failed to start inference")
         # Startup failed before the pump thread took over (most often Popen
@@ -691,6 +893,7 @@ def handle_inference_status() -> dict[str, Any]:
         rollout_elapsed = time.time() - _inference_rollout_started_at if _inference_rollout_started_at else 0
         return {
             "inference_active": inference_active,
+            "steps": _steps_payload() if inference_active else [],
             "started_at": _inference_started_at,
             "rollout_started_at": _inference_rollout_started_at,
             "elapsed_s": elapsed,
