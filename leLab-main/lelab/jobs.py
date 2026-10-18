@@ -175,7 +175,10 @@ class JobRunner(Protocol):
 
 
 # tqdm progress: "Training:   1%|▏         | 125/10000 [02:02<2:36:10,  1.05step/s]"
-_TQDM_RE = re.compile(r"Training:\s*\d+%[^|]*\|[^|]*\|\s*(\d+)/(\d+)\s*\[(?:[\d:]+)<([\d:]+)")
+_TQDM_RE = re.compile(r"Training:\s*\d+%[^|]*\|[^|]*\|\s*(\d+)/(\d+)\s*\[([\d:]+)<([\d:]+)")
+# Steps before the time-left estimate switches from tqdm's own guess to the
+# run's average speed (the first steps include warm-up).
+_STEADY_ETA_AFTER_STEPS = 50
 
 # Wandb prints something like "wandb: 🚀 View run at https://wandb.ai/<entity>/<project>/runs/<id>"
 # when it boots. We capture the first URL of that shape we see.
@@ -216,7 +219,15 @@ def parse_metrics_into(line: str, metrics: TrainingMetrics) -> None:
                 total = int(tqdm_match.group(2))
                 if total > 0:
                     metrics.total_steps = total
-                eta = _parse_duration(tqdm_match.group(3))
+                # tqdm's own estimate follows the last few steps, so one slow
+                # step (e.g. while a log or checkpoint is written) made "time
+                # left" jump from 45 minutes to 2.5 hours and back. Use the
+                # average speed of the run so far instead, once there is one.
+                current = metrics.current_step or 0
+                elapsed = _parse_duration(tqdm_match.group(3))
+                eta = _parse_duration(tqdm_match.group(4))
+                if elapsed is not None and current >= _STEADY_ETA_AFTER_STEPS and total > current:
+                    eta = elapsed / current * (total - current)
                 if eta is not None:
                     metrics.eta_seconds = eta
             except (ValueError, IndexError):

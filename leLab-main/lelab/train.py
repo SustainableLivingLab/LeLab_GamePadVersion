@@ -255,6 +255,24 @@ def _cloud_repo_placeholder() -> str:
     return f"{user}/train_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
 
 
+def _cloud_num_workers(flavor: str) -> int:
+    """Data-loading workers for an HF Jobs machine: one per CPU, keeping one
+    for the training process itself (4 to 16)."""
+    import re
+
+    try:
+        from .utils.hf_auth import shared_hf_api
+
+        for hardware in shared_hf_api().list_jobs_hardware():
+            if getattr(hardware, "name", None) == flavor:
+                match = re.search(r"\d+", str(getattr(hardware, "cpu", "")))
+                if match:
+                    return max(4, min(16, int(match.group()) - 1))
+    except Exception:
+        pass
+    return 4
+
+
 def _short_job_name(name: str, limit: int = 40) -> str:
     """The job name, cut at a word boundary to at most `limit` characters."""
     name = name.strip()
@@ -373,7 +391,14 @@ def build_training_command(
     # Core training params
     cmd.extend(["--steps", str(request.steps)])
     cmd.extend(["--batch_size", str(request.batch_size)])
-    cmd.extend(["--num_workers", str(request.num_workers)])
+    num_workers = request.num_workers
+    if is_cloud_run and num_workers == 4 and job_target.flavor:
+        # Small models (ACT, SmolVLA) spend most of each cloud step waiting
+        # for video frames to be decoded (ACT on an H200: 0.72 s waiting vs
+        # 0.17 s on the GPU). lerobot's default of 4 decoding workers leaves
+        # most of the cloud machine's CPUs idle, so use them.
+        num_workers = _cloud_num_workers(job_target.flavor)
+    cmd.extend(["--num_workers", str(num_workers)])
     if request.seed is not None:
         cmd.extend(["--seed", str(request.seed)])
 
