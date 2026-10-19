@@ -20,6 +20,8 @@ lives in app/jobs.py.
 
 import json
 import re
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -38,8 +40,19 @@ class TrainingRequest(BaseModel):
     dataset_episodes: list[int] | None = None
     dataset_image_transforms_enable: bool = False
 
-    # Policy configuration
+    # Policy configuration. policy_type trains that architecture from scratch;
+    # policy_path instead fine-tunes a pretrained checkpoint (Hub id or local
+    # dir, e.g. SMOLVLA_BASE) and takes precedence -- its own config says
+    # which policy type it is.
     policy_type: str = "act"
+    policy_path: str | None = None
+    # Weights-only starting point for a --policy.type run (pi0.5 starts from
+    # PI05_BASE this way). Unlike policy_path, the camera / feature names then
+    # come from the dataset, so no --rename_map is needed.
+    policy_pretrained_path: str | None = None
+    # pi0.5: freeze the vision-language part and train only the action expert.
+    # Needed to fit a ~16 GB GPU; None = local runs True, cloud runs False.
+    policy_train_expert_only: bool | None = None
 
     # Core training parameters
     steps: int = 10000
@@ -103,6 +116,172 @@ class TrainingRequest(BaseModel):
     config_path: str | None = None
 
 
+SMOLVLA_BASE = "lerobot/smolvla_base"
+
+_IMAGE_PREFIX = "observation.images."
+
+
+def _read_json_file(repo_or_dir: str, filename: str, repo_type: str, revision: str | None = None) -> dict:
+    """A small JSON file from a local directory, or from the Hub (cached)."""
+    local = Path(repo_or_dir) / filename
+    if local.is_file():
+        return json.loads(local.read_text(encoding="utf-8"))
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(repo_id=repo_or_dir, filename=filename, repo_type=repo_type, revision=revision)
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _dataset_camera_keys(request: TrainingRequest) -> list[str]:
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    root = request.dataset_root or str(HF_LEROBOT_HOME / request.dataset_repo_id)
+    if (Path(root) / "meta" / "info.json").is_file():
+        info = _read_json_file(root, "meta/info.json", "dataset")
+    else:
+        info = _read_json_file(request.dataset_repo_id, "meta/info.json", "dataset", request.dataset_revision)
+    return sorted(key for key in info.get("features", {}) if key.startswith(_IMAGE_PREFIX))
+
+
+def camera_rename_map(request: TrainingRequest) -> dict[str, str]:
+    """Map the dataset's camera keys onto the pretrained policy's own.
+
+    A pretrained checkpoint keeps the camera names it was trained with (e.g.
+    smolvla_base's generic camera1/2/3), and lerobot refuses to fine-tune on a
+    dataset whose cameras are named differently unless given a --rename_map.
+    Cameras are paired in sorted-name order; a dataset with fewer cameras than
+    the checkpoint is fine (SmolVLA only needs one), more is an error.
+    """
+    policy_cfg = _read_json_file(request.policy_path, "config.json", "model")
+    policy_cams = sorted(
+        key
+        for key, feature in (policy_cfg.get("input_features") or {}).items()
+        if feature.get("type") == "VISUAL"
+    )
+    dataset_cams = _dataset_camera_keys(request)
+    if not policy_cams or set(dataset_cams) <= set(policy_cams):
+        return {}
+    if len(dataset_cams) > len(policy_cams):
+        raise ValueError(
+            f"Dataset has {len(dataset_cams)} cameras but {request.policy_path} only takes {len(policy_cams)}."
+        )
+    return dict(zip(dataset_cams, policy_cams, strict=False))
+
+
+PI05_BASE = "lerobot/pi05_base"
+# pi0.5 reads the task sentence with this gated tokenizer: the Hugging Face
+# account must have accepted its license.
+PI05_TOKENIZER_REPO = "google/paligemma-3b-pt-224"
+
+
+def _require_pi05_ready_if_needed(request: TrainingRequest, is_local_run: bool) -> None:
+    """pi0.5 needs the [pi] extra (local runs) and access to the gated
+    PaliGemma tokenizer (local and cloud: the cloud machine uses this
+    account's token). Fail the request up front with what to do (ValueError
+    -> HTTP 400) instead of crashing minutes into the run."""
+    if request.policy_type != "pi05" or request.policy_path:
+        return
+    if is_local_run:
+        import importlib.util
+
+        missing = [name for name in ("transformers", "scipy") if importlib.util.find_spec(name) is None]
+        if missing:
+            raise ValueError(
+                "pi0.5 training needs extra packages that aren't installed (" + ", ".join(missing) + "). "
+                'In the leLab-main folder run: uv pip install -e ".[pi]" and then restart LeLab.'
+            )
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import GatedRepoError
+
+    try:
+        hf_hub_download(PI05_TOKENIZER_REPO, "config.json")
+    except GatedRepoError as exc:
+        raise ValueError(
+            "pi0.5 needs Google's PaliGemma model, which you have to request access to once. Open "
+            f"https://huggingface.co/{PI05_TOKENIZER_REPO} while logged in to the same Hugging Face account "
+            "as LeLab, accept the license, wait for access to be granted, then try again."
+        ) from exc
+
+
+def _require_smolvla_extra_if_needed(request: TrainingRequest) -> None:
+    """SmolVLA's dependencies (transformers etc.) are an optional extra, so a
+    normal install doesn't download them. Fail the request up front with the
+    install command (a ValueError -> HTTP 400 in server.py) rather than
+    letting the training subprocess die on an ImportError minutes in."""
+    if request.policy_path:
+        policy_type = _read_json_file(request.policy_path, "config.json", "model").get("type")
+    else:
+        policy_type = request.policy_type
+    if policy_type != "smolvla":
+        return
+
+    import importlib.util
+
+    missing = [name for name in ("transformers", "num2words") if importlib.util.find_spec(name) is None]
+    if missing:
+        raise ValueError(
+            "SmolVLA training needs extra packages that aren't installed ("
+            + ", ".join(missing)
+            + '). In the leLab-main folder run: uv pip install -e ".[smolvla]" -- or, for the one-line '
+            'install, reinstall with "lelab-gamepad[smolvla] @ git+https://github.com/SustainableLivingLab/'
+            'LeLab_GamePadVersion.git@Gokcever1#subdirectory=leLab-main". Then restart LeLab.'
+        )
+
+
+def _require_recorded_episodes(request: TrainingRequest) -> None:
+    """A local dataset with 0 episodes (a recording that failed before saving
+    any) makes lerobot fall back to downloading it from the Hub, which fails
+    with an unhelpful 401. Say what's actually wrong instead."""
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    from .datasets import local_dataset_episode_count
+
+    root = Path(request.dataset_root) if request.dataset_root else HF_LEROBOT_HOME / request.dataset_repo_id
+    if local_dataset_episode_count(root) == 0:
+        raise ValueError(
+            f'The dataset "{request.dataset_repo_id}" has no recorded episodes -- its recording stopped '
+            "before any episode was saved. Pick a dataset with episodes, or record a new one."
+        )
+
+
+def _cloud_repo_placeholder() -> str:
+    """A valid <user>/<name> model repo id for the submit-time check."""
+    from datetime import datetime
+
+    from .utils.hf_auth import cached_whoami
+
+    info = cached_whoami() or {}
+    user = info.get("name") or "lelab"
+    return f"{user}/train_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+
+
+def _cloud_num_workers(flavor: str) -> int:
+    """Data-loading workers for an HF Jobs machine: one per CPU, keeping one
+    for the training process itself (4 to 16)."""
+    import re
+
+    try:
+        from .utils.hf_auth import shared_hf_api
+
+        for hardware in shared_hf_api().list_jobs_hardware():
+            if getattr(hardware, "name", None) == flavor:
+                match = re.search(r"\d+", str(getattr(hardware, "cpu", "")))
+                if match:
+                    return max(4, min(16, int(match.group()) - 1))
+    except Exception:
+        pass
+    return 4
+
+
+def _short_job_name(name: str, limit: int = 40) -> str:
+    """The job name, cut at a word boundary to at most `limit` characters."""
+    name = name.strip()
+    if len(name) <= limit:
+        return name
+    cut = name[:limit].rsplit(" ", 1)[0].rstrip(" -_")
+    return cut or name[:limit]
+
+
 def build_training_command(
     request: TrainingRequest,
     output_dir: str,
@@ -121,7 +300,11 @@ def build_training_command(
     PATH lookup picks up a different env (uv tool venv, miniforge3 base, etc.)
     that lacks lerobot.
     """
-    cmd: list[str] = [python_executable, "-m", "lerobot.scripts.lerobot_train"]
+    is_cloud_run = job_target is not None and job_target.runner == "hf_cloud"
+    # Cloud runs go through lelab.cloud_submit, which wraps lerobot-train with
+    # fixes for submitting --policy.path runs from Windows (see that module).
+    entry = "lelab.cloud_submit" if is_cloud_run else "lerobot.scripts.lerobot_train"
+    cmd: list[str] = [python_executable, "-m", entry]
 
     # Dataset
     cmd.extend(["--dataset.repo_id", request.dataset_repo_id])
@@ -133,14 +316,89 @@ def build_training_command(
         cmd.extend(["--dataset.episodes"] + [str(ep) for ep in request.dataset_episodes])
     if request.dataset_image_transforms_enable:
         cmd.extend(["--dataset.image_transforms.enable", "true"])
+    if sys.platform == "win32":
+        # lerobot's get_safe_default_video_backend() picks torchcodec whenever
+        # it *imports* successfully, but on Windows that import can succeed
+        # while the actual native DLL (libtorchcodec_core*.dll, which needs
+        # FFmpeg's shared libs) still fails to load at decode time -- crashing
+        # training with a FileNotFoundError/OSError once it actually reads a
+        # video frame. pyav doesn't have this gap and works reliably on
+        # Windows, so force it there rather than trusting the "safe" default.
+        cmd.extend(["--dataset.video_backend", "pyav"])
 
     # Policy
-    cmd.extend(["--policy.type", request.policy_type])
+    is_local_run = job_target is None or job_target.runner != "hf_cloud"
+    if is_local_run:
+        _require_smolvla_extra_if_needed(request)
+        _require_recorded_episodes(request)
+    _require_pi05_ready_if_needed(request, is_local_run)
+    if request.policy_path:
+        policy_path = request.policy_path
+        if sys.platform == "win32" and is_local_run and not Path(policy_path).is_dir():
+            # lerobot stores --policy.path as a pathlib.Path, which on Windows
+            # turns a Hub id like "lerobot/smolvla_base" into
+            # "lerobot\smolvla_base" -- an invalid repo id by the time it
+            # downloads the weights. Download it ourselves (cached after the
+            # first time) and hand lerobot the local folder instead.
+            from huggingface_hub import snapshot_download
+
+            policy_path = snapshot_download(repo_id=policy_path, repo_type="model")
+        # Must be the single "--policy.path=<x>" token: lerobot pre-parses it
+        # (parser.get_path_arg) and argparse rejects the space-separated form.
+        cmd.append(f"--policy.path={policy_path}")
+        if not is_local_run and not request.resume:
+            # lerobot only names the cloud model repo itself for --policy.type
+            # runs; for --policy.path it rejects the submit ("save_checkpoint_to_hub
+            # requires --policy.repo_id"). Any valid name gets it through --
+            # lerobot renames the repo to <user>/<job name>_<time> when staging.
+            cmd.append(f"--policy.repo_id={_cloud_repo_placeholder()}")
+        rename_map = camera_rename_map(request)
+        if rename_map:
+            cmd.append(f"--rename_map={json.dumps(rename_map)}")
+    else:
+        cmd.extend(["--policy.type", request.policy_type])
+        if request.policy_pretrained_path:
+            pretrained = request.policy_pretrained_path
+            if sys.platform == "win32" and is_local_run and not Path(pretrained).is_dir():
+                # Same Windows Hub-id-as-Path problem as --policy.path above.
+                from huggingface_hub import snapshot_download
+
+                pretrained = snapshot_download(repo_id=pretrained, repo_type="model")
+            cmd.append(f"--policy.pretrained_path={pretrained}")
+        if request.policy_type == "pi05":
+            # Recommended pi0.5 fine-tuning settings (LeRobot docs). Mean/std
+            # normalization: the default QUANTILES mode needs q01/q99 stats our
+            # recorded datasets don't have.
+            cmd.append(
+                '--policy.normalization_mapping={"ACTION": "MEAN_STD", "STATE": "MEAN_STD", "VISUAL": "IDENTITY"}'
+            )
+            cmd.append("--policy.gradient_checkpointing=true")
+            cmd.append("--policy.dtype=bfloat16")
+            # The whole 3B model needs ~80 GB to fine-tune; on a local ~16 GB GPU
+            # only the action expert is trained (the docs' lower-memory option).
+            expert_only = request.policy_train_expert_only
+            if expert_only is None:
+                expert_only = is_local_run
+            if expert_only:
+                cmd.append("--policy.train_expert_only=true")
+                cmd.append("--policy.freeze_vision_encoder=true")
+        if request.policy_type == "smolvla":
+            # "From scratch" for SmolVLA means a fresh action expert on top of
+            # the PRETRAINED SmolVLM backbone. lerobot's own default here is
+            # False, which would leave the whole VLM randomly initialised too.
+            cmd.extend(["--policy.load_vlm_weights", "true"])
 
     # Core training params
     cmd.extend(["--steps", str(request.steps)])
     cmd.extend(["--batch_size", str(request.batch_size)])
-    cmd.extend(["--num_workers", str(request.num_workers)])
+    num_workers = request.num_workers
+    if is_cloud_run and num_workers == 4 and job_target.flavor:
+        # Small models (ACT, SmolVLA) spend most of each cloud step waiting
+        # for video frames to be decoded (ACT on an H200: 0.72 s waiting vs
+        # 0.17 s on the GPU). lerobot's default of 4 decoding workers leaves
+        # most of the cloud machine's CPUs idle, so use them.
+        num_workers = _cloud_num_workers(job_target.flavor)
+    cmd.extend(["--num_workers", str(num_workers)])
     if request.seed is not None:
         cmd.extend(["--seed", str(request.seed)])
 
@@ -197,7 +455,9 @@ def build_training_command(
         cmd.extend(["--output_dir", output_dir])
     cmd.extend(["--resume", "true" if request.resume else "false"])
     if request.job_name:
-        cmd.extend(["--job_name", request.job_name])
+        # A cloud run's model repo is named after the job: keep it short (a
+        # whole sentence made local paths too long for Windows).
+        cmd.extend(["--job_name", _short_job_name(request.job_name)])
 
     # W&B
     cmd.extend(["--wandb.enable", "true" if request.wandb_enable else "false"])
@@ -253,5 +513,18 @@ def build_training_command(
         # abort the submit. A resume already pushes back to its source repo, so skip it.
         if request.save_checkpoint and not request.resume:
             cmd.extend(["--save_checkpoint_to_hub", "true"])
+
+    if request.policy_path:
+        # With --policy.path, lerobot reads every other --policy.* flag as an
+        # override of the loaded config, and only accepts the "--policy.x=y"
+        # form for those -- a separate value token is an unrecognized argument.
+        merged: list[str] = []
+        args = iter(cmd)
+        for arg in args:
+            if arg.startswith("--policy.") and "=" not in arg:
+                merged.append(f"{arg}={next(args)}")
+            else:
+                merged.append(arg)
+        cmd = merged
 
     return cmd

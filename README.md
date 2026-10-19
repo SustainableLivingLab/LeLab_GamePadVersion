@@ -26,14 +26,20 @@ manual setup further down for anyone who wants to see the code as they go.
 If you just want to run LeLab GamePad Version and don't plan to edit the code, this single
 command does everything: installs [uv](https://docs.astral.sh/uv/) (a fast Python package
 manager) if it isn't already on your machine, installs LeLab GamePad Version with it, and starts
-the app. Nothing else needs to be pre-installed except PowerShell itself, which every Windows
-machine already has.
+the app. The only other thing it needs is **Git** (<https://git-scm.com/downloads>, accept the
+defaults): `uv` uses it to download this repo and LeRobot, and without it the install fails with
+"Git executable not found".
 
-Open PowerShell and paste:
+Open **PowerShell** (not Command Prompt) and paste:
 
 ```powershell
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install --python 3.13 "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git@pilot#subdirectory=leLab-main" --reinstall; lelab-gamepad
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install --python 3.13 "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git@pilot-plus#subdirectory=leLab-main" --reinstall; lelab-gamepad
 ```
+
+The `@pilot-plus` in that URL matters: it's the branch with the current code. Without it `uv`
+installs the repo's default branch, which is behind and installs an older command called `lelab`
+instead of `lelab-gamepad` (the symptom is `'lelab-gamepad' is not recognized` right after an
+install that otherwise looked successful).
 
 `--reinstall` makes `uv` fetch and install the current code fresh every time you run this command,
 instead of reusing whatever was already installed. Use this exact command (with `--reinstall`)
@@ -56,6 +62,13 @@ training itself runs on Hugging Face's cloud, not your machine. If you want a CU
 faster local policy rollout, install it yourself afterward with `pip install torch --index-url
 https://download.pytorch.org/whl/cu124` (match the CUDA version to your GPU driver) from inside
 the tool's environment, or follow the manual setup below.
+
+**Training SmolVLA policies locally** needs a few extra packages (`transformers` and friends, a
+sizeable download that arm control, calibration and recording don't use), so they're an optional
+extra. On a machine that will train SmolVLA, use
+`"lelab-gamepad[smolvla] @ git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git@pilot-plus#subdirectory=leLab-main"`
+in place of the `git+...` URL in the one-liner above, or `uv pip install -e ".[smolvla]"` for the
+manual setup. Starting a SmolVLA training run without them shows this same instruction.
 
 This is a separate command from upstream LeLab's own `lelab`, so it installs and runs side by
 side without needing to uninstall anything.
@@ -112,12 +125,12 @@ A local GPU only speeds up local policy rollout, if you use that feature.
 Open a terminal (PowerShell on Windows) and run:
 
 ```powershell
-git clone <this-repo-url> LeLab_GamePadVersion
+git clone -b pilot-plus https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git LeLab_GamePadVersion
 cd LeLab_GamePadVersion\leLab-main
 ```
 
-Replace `<this-repo-url>` with this repository's actual clone URL (the green "Code" button on
-its GitHub page, then copy the HTTPS URL).
+`-b pilot-plus` checks out the branch with the current code; a plain clone lands on the default
+branch, which is behind (see the note under the Quick Start one-liner).
 
 Everything from here on happens **inside `leLab-main`**. If a command fails with something like
 "file not found" or "no such file or directory," first check you're in the right folder:

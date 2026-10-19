@@ -49,6 +49,9 @@ class InferenceRequest(BaseModel):
     task: str = ""
     cameras: dict[str, dict[str, Any]] = {}
     duration_s: int = 60
+    # Run the policy on the cloud GPU (remote_server.py) instead of this
+    # computer; the server must already be started and ready.
+    remote: bool = False
 
 
 inference_active: bool = False
@@ -59,6 +62,10 @@ _inference_meta: dict[str, Any] = {}
 # Guards mutations to the globals above; held only for the short critical
 # sections in start/stop/status.
 _state_lock = threading.Lock()
+# Stop pressed while a run is still being prepared (downloading the model,
+# making its compatibility copy): there is no process to stop yet, so the
+# start sequence checks this before launching one.
+_inference_cancel = threading.Event()
 _HUB_REF_RE = re.compile(r"^(?P<repo>[^@]+)@checkpoints/(?P<step_dir>\d+)$")
 _HUB_ROOT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@root$")
 # lerobot prints this once per run, the moment its main control loop is
@@ -66,6 +73,134 @@ _HUB_ROOT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@root$")
 # UI can present a "rollout time" separate from the multi-second policy
 # load + bus connect + camera connect setup overhead.
 _ROLLOUT_START_MARKER = "Rollout setup complete"
+
+# The run's steps, shown in the app while it starts ("Download the model:
+# 3.1 of 9.4 GB", "Load the AI: 30 s, last time about 70 s"). Each entry:
+# {"id", "label", "state": pending|active|done, "started", "ended", "detail"}.
+# Moved along by the start sequence and by lines the run prints
+# (_STEP_MARKERS); durations are kept in _TIMINGS_FILE for "last time".
+_run_steps: list[dict[str, Any]] = []
+_run_download: dict[str, Any] = {}
+_STEP_MARKERS = (
+    ("Policy loaded", "load"),  # lerobot rollout: model is on the device
+    ("Robot connected", "connect"),  # both: arm and cameras connected
+    ("Rollout setup complete", "first_plan"),  # cloud: first plan arrived
+    ("Duration limit reached", "run"),  # both: time is up, arm goes home
+)
+
+
+def _timings_file() -> Path:
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    return Path(HF_LEROBOT_HOME) / "lelab_run_timings.json"
+
+
+def _load_timings() -> dict[str, Any]:
+    try:
+        return json.loads(_timings_file().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_step_time(step_id: str, seconds: float) -> None:
+    key = _inference_meta.get("policy_ref") or ""
+    try:
+        timings = _load_timings()
+        timings.setdefault(key, {})[step_id] = round(seconds, 1)
+        _timings_file().write_text(json.dumps(timings, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _init_steps(remote: bool, local_model: bool) -> None:
+    global _run_steps
+    if remote:
+        ids = [
+            ("connect", "Connect the arm and cameras"),
+            ("first_plan", "Get the first plan from the cloud GPU"),
+        ]
+    else:
+        ids = [] if local_model else [("download", "Download the model")]
+        ids += [
+            ("prepare", "Prepare the model for this computer"),
+            ("load", "Load the AI"),
+            ("connect", "Connect the arm and cameras"),
+        ]
+    ids += [("run", "The AI drives the arm"), ("return", "Return to the start position")]
+    _run_steps = [{"id": i, "label": label, "state": "pending", "started": None, "ended": None, "detail": None}
+                  for i, label in ids]
+
+
+def _step(step_id: str) -> dict[str, Any] | None:
+    return next((step for step in _run_steps if step["id"] == step_id), None)
+
+
+def _finish_step(step_id: str) -> None:
+    """Mark a step done (and any earlier ones), and start the next one."""
+    now = time.time()
+    ids = [step["id"] for step in _run_steps]
+    if step_id not in ids:
+        return
+    index = ids.index(step_id)
+    for step in _run_steps[: index + 1]:
+        if step["state"] != "done":
+            if step["started"] is None:
+                step["started"] = now
+            step["state"] = "done"
+            step["ended"] = now
+            if step["id"] in ("load", "connect", "first_plan", "download", "prepare"):
+                _save_step_time(step["id"], now - step["started"])
+    if index + 1 < len(_run_steps) and _run_steps[index + 1]["state"] == "pending":
+        _run_steps[index + 1]["state"] = "active"
+        _run_steps[index + 1]["started"] = now
+
+
+def _start_step(step_id: str) -> None:
+    step = _step(step_id)
+    if step and step["state"] == "pending":
+        step["state"] = "active"
+        step["started"] = time.time()
+
+
+def _steps_payload() -> list[dict[str, Any]]:
+    now = time.time()
+    timings = _load_timings().get(_inference_meta.get("policy_ref") or "", {})
+    out = []
+    for step in _run_steps:
+        item = {"id": step["id"], "label": step["label"], "state": step["state"], "detail": step["detail"]}
+        if step["started"] is not None:
+            item["seconds"] = round((step["ended"] or now) - step["started"], 1)
+        if step["id"] in timings:
+            item["last_seconds"] = timings[step["id"]]
+        if step["id"] == "download" and step["state"] == "active" and _run_download.get("dir"):
+            item["detail"] = _download_detail()
+        out.append(item)
+    return out
+
+
+def _download_detail() -> str | None:
+    total = _run_download.get("total")
+    try:
+        done = sum(f.stat().st_size for f in Path(_run_download["dir"]).rglob("*") if f.is_file())
+    except Exception:
+        return None
+    if total:
+        return f"{done / 1e9:.1f} of {total / 1e9:.1f} GB"
+    return f"{done / 1e9:.1f} GB so far"
+
+
+def _expected_download_bytes(repo_id: str, pattern_prefix: str | None) -> int | None:
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(repo_id, files_metadata=True)
+        return sum(
+            (sibling.size or 0)
+            for sibling in info.siblings
+            if pattern_prefix is None or sibling.rfilename.startswith(pattern_prefix)
+        )
+    except Exception:
+        return None
 
 
 def _pump_stdout(proc: subprocess.Popen, log_handle) -> None:
@@ -83,6 +218,15 @@ def _pump_stdout(proc: subprocess.Popen, log_handle) -> None:
                 log_handle.flush()
             except Exception:
                 pass
+            for marker, step_id in _STEP_MARKERS:
+                if marker in line:
+                    with _state_lock:
+                        # Cloud runs have no "load" step; local runs no
+                        # "first_plan" one (_finish_step ignores those).
+                        if step_id == "first_plan" and not _step("first_plan"):
+                            _finish_step("connect")
+                        else:
+                            _finish_step(step_id)
             if _inference_rollout_started_at is None and _ROLLOUT_START_MARKER in line:
                 _inference_rollout_started_at = time.time()
                 logger.info(
@@ -110,6 +254,21 @@ def _detect_device() -> str:
     return "cpu"
 
 
+def _short_model_dir(repo_id: str) -> str:
+    """A short local folder for a downloaded model.
+
+    Hugging Face's own cache path repeats the repo name and adds a 40-letter
+    snapshot id, so with a long repo name (e.g. a whole task sentence as the
+    job name) files like policy_postprocessor.json went past Windows' 260
+    character path limit and silently failed to download."""
+    import hashlib
+
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    digest = hashlib.sha1(repo_id.encode("utf-8")).hexdigest()[:12]
+    return str(Path(HF_LEROBOT_HOME) / "models" / digest)
+
+
 def _resolve_policy_path(policy_ref: str) -> str:
     """Turn a checkpoints API ref into a local path that lerobot accepts.
 
@@ -132,12 +291,100 @@ def _resolve_policy_path(policy_ref: str) -> str:
             repo_id=repo_id,
             repo_type="model",
             allow_patterns=[f"checkpoints/{step_dir}/pretrained_model/*"],
+            local_dir=_short_model_dir(repo_id),
         )
         return str(Path(local_root) / "checkpoints" / step_dir / "pretrained_model")
     m = _HUB_ROOT_REF_RE.match(policy_ref)
     if m:
-        return snapshot_download(repo_id=m.group("repo"), repo_type="model")
+        return snapshot_download(repo_id=m.group("repo"), repo_type="model", local_dir=_short_model_dir(m.group("repo")))
     raise ValueError(f"Unrecognised policy ref: {policy_ref!r}")
+
+
+def _make_locally_loadable(policy_path: str) -> str:
+    """Return a policy dir this install's lerobot can load.
+
+    A model trained on Hugging Face cloud runs the latest lerobot image, which
+    can write config.json fields this pinned lerobot doesn't know (e.g.
+    ``dtype``), and draccus refuses the whole file: "The fields `dtype` are
+    not valid for ACTConfig". Such fields are dropped in a copy (under
+    HF_LEROBOT_HOME/compat_policies) so the downloaded original stays intact.
+
+    Newer lerobot also saves SmolVLA's text tokenizer inside the model folder
+    and refers to it by the bare relative name "tokenizer"; this lerobot
+    treats that as a Hub model id and fails ("tokenizer is not a local folder
+    and is not a valid model identifier"). In the copy, such a reference is
+    pointed at the copied folder's absolute path.
+
+    Returns policy_path unchanged when nothing needs changing.
+    """
+    import dataclasses
+    import hashlib
+    import shutil
+
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    import lerobot.policies.factory  # noqa: F401  registers the policy config classes
+
+    cfg = _read_policy_config(policy_path)
+    try:
+        config_cls = PreTrainedConfig.get_choice_class(cfg.get("type"))
+    except Exception:
+        return policy_path
+    known = {field.name for field in dataclasses.fields(config_cls)}
+    unknown = sorted(key for key in cfg if key != "type" and key not in known)
+    relative_tokenizer = _relative_tokenizer_steps(policy_path)
+    if not unknown and not relative_tokenizer:
+        return policy_path
+
+    digest = hashlib.sha1(str(Path(policy_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    compat_dir = Path(HF_LEROBOT_HOME) / "compat_policies" / digest
+    if compat_dir.exists():
+        shutil.rmtree(compat_dir)
+    shutil.copytree(policy_path, compat_dir)
+    if unknown:
+        for key in unknown:
+            cfg.pop(key, None)
+        with open(compat_dir / "config.json", "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=4)
+    for processor_file in relative_tokenizer:
+        path = compat_dir / processor_file
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for step in data.get("steps", []):
+            step_cfg = step.get("config") or {}
+            name = step_cfg.get("tokenizer_name")
+            if isinstance(name, str) and (compat_dir / name).is_dir():
+                step_cfg["tokenizer_name"] = (compat_dir / name).as_posix()
+        path.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    logger.warning(
+        "Policy was saved by a newer lerobot (e.g. on Hugging Face cloud); running an adjusted copy "
+        "(dropped config fields: %s; tokenizer path fixed in: %s): %s",
+        ", ".join(unknown) or "none",
+        ", ".join(relative_tokenizer) or "none",
+        compat_dir,
+    )
+    return str(compat_dir)
+
+
+def _relative_tokenizer_steps(policy_path: str) -> list[str]:
+    """Processor files whose tokenizer step names a folder inside the model
+    directory (e.g. "tokenizer") instead of a Hub id or absolute path."""
+    found = []
+    for processor_file in sorted(Path(policy_path).glob("policy_*processor.json")):
+        try:
+            data = json.loads(processor_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for step in data.get("steps", []):
+            name = (step.get("config") or {}).get("tokenizer_name")
+            if (
+                isinstance(name, str)
+                and not Path(name).is_absolute()
+                and (Path(policy_path) / name).is_dir()
+            ):
+                found.append(processor_file.name)
+                break
+    return found
 
 
 def _read_policy_config(policy_path: str) -> dict[str, Any]:
@@ -185,6 +432,26 @@ def _rollout_inference_args(policy_path: str) -> list[str]:
     # recommend keeping this at 0 (never > 5) for stable real-robot rollout.
     args.append("--inference.queue_threshold=0")
     return args
+
+
+def _rollout_camera_rename_map(policy_path: str, cameras: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """Map the robot's camera keys onto the policy's, when they differ.
+
+    A policy fine-tuned from a pretrained checkpoint (e.g. smolvla_base) keeps
+    that checkpoint's camera names (camera1, camera2, ...) -- see
+    train.camera_rename_map, which paired the dataset's cameras onto them in
+    sorted-name order. Pairing the live cameras the same way puts each one
+    back in the slot it was trained in. Policies trained from scratch already
+    use the robot's own names, so this returns {} for them.
+    """
+    cfg = _read_policy_config(policy_path)
+    policy_cams = sorted(
+        key for key, feature in (cfg.get("input_features") or {}).items() if feature.get("type") == "VISUAL"
+    )
+    robot_cams = sorted(f"observation.images.{name}" for name in cameras)
+    if not policy_cams or set(robot_cams) <= set(policy_cams):
+        return {}
+    return dict(zip(robot_cams, policy_cams, strict=False))
 
 
 def _format_cameras_arg(cameras: dict[str, dict[str, Any]]) -> str:
@@ -238,31 +505,46 @@ def _friendly_hint(error_text: str | None) -> str | None:
     if not error_text:
         return None
     low = error_text.lower()
+    if _WEIGHTS_NOT_LOADED.decode() in low:
+        return (
+            "The AI's trained weights could not be loaded, so it was stopped before moving the arm. "
+            "Restart LeLab and try again."
+        )
+    if "failed to open opencvcamera" in low:
+        # Seen with two USB cameras behind one hub chain: each reserves a large
+        # share of the USB 2.0 link at full size, so the second can't open
+        # (previews still work, being small).
+        return (
+            "A camera couldn't be opened. If both cameras are plugged into the same USB hub, there isn't "
+            "enough room on it for both at full size. Plug one camera straight into the computer (a port "
+            "on the back, or a USB-C port with an adapter), then try again. Also check that no other "
+            "program is using the camera."
+        )
     if "overload" in low or "torque_enable" in low:
         return (
-            "A motor overloaded — usually the gripper holding an object too hard. Release the object / "
-            "open the gripper and power-cycle the arm before trying again."
+            "A motor overloaded, usually the gripper holding an object too hard. Release the object or "
+            "open the gripper, then turn the arm's power off and on before trying again."
         )
     if "missing motor ids" in low or "motor check failed" in low:
         return (
-            "A follower motor isn't responding (often the gripper, id 6). If a skill was holding an object "
-            "it likely overloaded — remove it, power-cycle the arm, then try teleoperation first."
+            "A motor on the arm isn't responding (often the gripper, id 6). If it was holding an object it "
+            "probably overloaded. Remove the object, turn the arm's power off and on, then try arm control first."
         )
     if "could not connect" in low or "failed to connect" in low or "not connected" in low:
-        return "Couldn't connect to the arm — make sure it's plugged in, powered on, and on the right port."
+        return "Couldn't connect to the arm. Make sure it's plugged in, powered on, and on the right port."
     if "frame is too old" in low or "no frame" in low or "frame timeout" in low:
         return (
-            "A camera can't keep up — frames are arriving too slowly. Lower its resolution/FPS, "
-            "set FOURCC=MJPG, and close other heavy apps, then try again."
+            "A camera can't keep up: its frames arrive too slowly. Close other heavy apps, and if both "
+            "cameras share a USB hub, plug one straight into the computer, then try again."
         )
     if "failed to set capture_" in low or "actual_width" in low or "actual_height" in low:
-        return "A camera doesn't support the configured resolution — open camera settings and click Auto."
+        return "A camera doesn't support the size it was asked for. Check the camera settings, then try again."
     if "permission" in low and ("port" in low or "com" in low):
         return "Couldn't open the serial port, close anything else using it, or run `lelab-gamepad --stop`."
     if "relative-action" in low or "relative chunk actions" in low:
         return (
             "This policy was trained with relative actions and needs RTC (chunked) inference. "
-            "Update lelab and try again — recent versions enable that automatically."
+            "Update LeLab and try again. Recent versions turn that on automatically."
         )
     return None
 
@@ -318,6 +600,10 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             }
         # Claim the slot now so a concurrent caller losing the race sees us.
         inference_active = True
+        _inference_cancel.clear()
+        _inference_meta = {"policy_ref": request.policy_ref, "duration_s": request.duration_s}
+        _init_steps(request.remote, Path(request.policy_ref).is_dir())
+        _run_download.clear()
 
     # Opened partway through setup; the stdout pump thread takes ownership once
     # it starts. Tracked here so a failure before that hand-off can close it
@@ -330,24 +616,77 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         # because lerobot appends `.json` itself when constructing
         # `calibration_dir / f"{id}.json"`.
         follower_id = setup_follower_calibration_file(request.follower_config)
-        policy_path = _resolve_policy_path(request.policy_ref)
+        if request.remote:
+            from . import remote_server
 
-        cmd = [
-            sys.executable,
-            "-m",
-            "lerobot.scripts.lerobot_rollout",
-            "--strategy.type=base",
-            f"--policy.path={policy_path}",
-            f"--policy.device={_detect_device()}",
+            server_url = remote_server.ready_url(request.policy_ref)
+            policy_path = None
+            with _state_lock:
+                _start_step("connect")
+        else:
+            if _step("download"):
+                m = _HUB_REF_RE.match(request.policy_ref) or _HUB_ROOT_REF_RE.match(request.policy_ref)
+                if m:
+                    repo_id = m.group("repo")
+                    prefix = (
+                        f"checkpoints/{m.group('step_dir')}/pretrained_model/" if "step_dir" in m.groupdict() else None
+                    )
+                    _run_download.update(
+                        dir=str(Path(_short_model_dir(repo_id)) / (prefix or "")),
+                        total=_expected_download_bytes(repo_id, prefix),
+                    )
+                with _state_lock:
+                    _start_step("download")
+            resolved = _resolve_policy_path(request.policy_ref)
+            with _state_lock:
+                _finish_step("download") if _step("download") else _start_step("prepare")
+            policy_path = _make_locally_loadable(resolved)
+            with _state_lock:
+                _finish_step("prepare")
+                load = _step("load")
+                if load is not None:
+                    load["label"] = "Load the AI into the GPU" if _detect_device() == "cuda" else "Load the AI"
+        if _inference_cancel.is_set():
+            with _state_lock:
+                inference_active = False
+            logger.info("Inference cancelled before it started")
+            return {"success": False, "status_code": 409, "message": "Stopped before the AI started."}
+
+        robot_args = [
             "--robot.type=so101_follower",
             f"--robot.port={request.follower_port}",
             f"--robot.id={follower_id}",
             f"--task={request.task}",
             f"--duration={request.duration_s}",
-            *_rollout_inference_args(policy_path),
         ]
+        if request.remote:
+            cmd = [sys.executable, "-m", "lelab.remote_rollout", f"--server_url={server_url}", *robot_args]
+        else:
+            cmd = [
+                sys.executable,
+                "-m",
+                "lerobot.scripts.lerobot_rollout",
+                "--strategy.type=base",
+                f"--policy.path={policy_path}",
+                f"--policy.device={_detect_device()}",
+                *robot_args,
+                *_rollout_inference_args(policy_path),
+            ]
         if request.cameras:
-            cmd.append(f"--robot.cameras={_format_cameras_arg(request.cameras)}")
+            # Open the cameras the way recording does (record._platform_backend:
+            # DirectShow on Windows). Left to OpenCV's own choice, the rollout
+            # picked another camera system whose numbering can differ from the
+            # previews/recording and which failed on the second of two
+            # cameras behind one USB hub ("Failed to open OpenCVCamera(0)").
+            from .record import _platform_backend
+
+            backend = int(_platform_backend())
+            cameras = {name: {"backend": backend, **cfg} for name, cfg in request.cameras.items()}
+            cmd.append(f"--robot.cameras={_format_cameras_arg(cameras)}")
+            # (The cloud server pairs camera names itself.)
+            rename_map = _rollout_camera_rename_map(policy_path, request.cameras) if policy_path else {}
+            if rename_map:
+                cmd.append(f"--rename_map={json.dumps(rename_map)}")
 
         log_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / "inference_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -356,6 +695,13 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        # Windows: a child whose output goes to a file writes in the old
+        # cp1252 charset, and lerobot's pi0/pi0.5 loader prints a check mark
+        # after reading the weights. That print raised, lerobot caught it and
+        # carried on WITHOUT the trained weights (a random model). UTF-8 output
+        # avoids it.
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
         # Feed a single newline into stdin so SOFollower.calibrate()'s
         # `input("Press ENTER to use the calibration file ...")` returns "" and
         # writes the existing calibration to the motors instead of hanging
@@ -383,6 +729,13 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             daemon=True,
         ).start()
         log_handle = None  # pump thread owns and closes it from here on
+    except ValueError as exc:
+        # A plain reason (e.g. the cloud GPU isn't ready yet).
+        if log_handle is not None:
+            log_handle.close()
+        with _state_lock:
+            inference_active = False
+        return {"success": False, "status_code": 409, "message": str(exc)}
     except Exception as exc:
         logger.exception("Failed to start inference")
         # Startup failed before the pump thread took over (most often Popen
@@ -393,6 +746,15 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         with _state_lock:
             inference_active = False
         return {"success": False, "status_code": 500, "message": f"Failed to start inference: {exc}"}
+
+    if _inference_cancel.is_set():
+        # Stop arrived while the process was being launched.
+        proc.kill()
+        proc.wait()
+        with _state_lock:
+            inference_active = False
+        logger.info("Inference cancelled right after launch")
+        return {"success": False, "status_code": 409, "message": "Stopped before the AI started."}
 
     with _state_lock:
         _inference_proc = proc
@@ -412,6 +774,10 @@ def handle_stop_inference() -> dict[str, Any]:
     global _inference_rollout_started_at, _inference_meta
 
     with _state_lock:
+        if inference_active and _inference_proc is None:
+            # Still preparing (download / copy): cancel it before it launches.
+            _inference_cancel.set()
+            return {"success": True, "message": "Stopping. The AI will not start."}
         if not inference_active or _inference_proc is None:
             return {"success": False, "status_code": 409, "message": "No inference is active"}
         proc = _inference_proc
@@ -436,9 +802,49 @@ def handle_stop_inference() -> dict[str, Any]:
     return {"success": True, "message": "Inference stopped"}
 
 
+# lerobot's pi0 / pi0.5 loaders don't fail when the weights can't be read:
+# they print this and return an untrained (random) model. Never let that
+# drive the arm.
+_WEIGHTS_NOT_LOADED = b"without loading pretrained weights"
+
+
+def _setup_crashed(log_path: str | None) -> bool:
+    """True when the rollout's log shows a Python traceback, or that the
+    model came up without its trained weights."""
+    if not log_path:
+        return False
+    try:
+        with open(log_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 64 * 1024))
+            data = fh.read()
+            return b"Traceback (most recent call last)" in data or _WEIGHTS_NOT_LOADED in data
+    except OSError:
+        return False
+
+
 def handle_inference_status() -> dict[str, Any]:
     global inference_active, _inference_proc, _inference_started_at
     global _inference_rollout_started_at, _inference_meta
+
+    # A rollout that crashed during setup (e.g. "Failed to open
+    # OpenCVCamera(0)" because something still held the camera) can print its
+    # traceback and then never exit -- leftover threads keep the process
+    # alive -- so the UI sat on "Loading the AI..." for hours. Before the arm
+    # is ever driven, a traceback means the run is over: end the process so
+    # the normal exit handling below reports the error.
+    with _state_lock:
+        proc = _inference_proc
+        log_path = _inference_meta.get("log_path")
+        rollout_started = _inference_rollout_started_at is not None
+    if proc is not None and proc.poll() is None and not rollout_started and _setup_crashed(log_path):
+        logger.warning("Inference crashed during setup but didn't exit -- ending it (pid=%s)", proc.pid)
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     # Finalise state lazily if the subprocess died on its own.
     with _state_lock:
@@ -457,6 +863,16 @@ def handle_inference_status() -> dict[str, Any]:
             # On failure, surface the real error from the log so the UI doesn't
             # have to send the user digging through the cache.
             error = _extract_error_from_log(finished_meta.get("log_path")) if rc else None
+            hint = _friendly_hint(error)
+            # Windows access violation (0xC0000005) with no Python traceback:
+            # while loading, that is almost always running out of memory (a
+            # large model like pi0.5 needs ~19 GB of RAM to load).
+            if rc in (3221225477, -1073741819) and finished_rollout_started is None:
+                hint = (
+                    "The AI crashed while loading, most likely because the computer ran out of memory. "
+                    "Close other programs (especially browser tabs) and try again. For big models like "
+                    "pi0.5, a larger Windows page file helps."
+                )
             outcome = _classify_outcome(rc, finished_rollout_started is not None, error)
             return {
                 "inference_active": False,
@@ -464,7 +880,7 @@ def handle_inference_status() -> dict[str, Any]:
                 "exit_code": rc,
                 "outcome": outcome,
                 "error": error,
-                "hint": _friendly_hint(error),
+                "hint": hint,
                 "policy_ref": finished_meta.get("policy_ref"),
                 "duration_s": finished_meta.get("duration_s"),
                 "log_path": finished_meta.get("log_path"),
@@ -477,6 +893,7 @@ def handle_inference_status() -> dict[str, Any]:
         rollout_elapsed = time.time() - _inference_rollout_started_at if _inference_rollout_started_at else 0
         return {
             "inference_active": inference_active,
+            "steps": _steps_payload() if inference_active else [],
             "started_at": _inference_started_at,
             "rollout_started_at": _inference_rollout_started_at,
             "elapsed_s": elapsed,

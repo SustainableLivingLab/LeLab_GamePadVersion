@@ -96,6 +96,90 @@ def apply_deadzone(value: float, deadzone: float = DEADZONE) -> float:
     return 0.0 if abs(value) < deadzone else value
 
 
+# Joystick-device picking. Windows lists anything that registers as a game
+# controller -- Steam's/ViGEm's virtual pads, vJoy, racing wheels, some gaming
+# mice and keyboards -- and the real controller isn't always index 0. Blindly
+# opening index 0 then "connects" fine and the arm silently ignores the real
+# sticks. Names are matched lowercase, as substrings.
+_NOT_A_GAMEPAD = ("vjoy", "wheel", "pedal", "throttle", "flight", "keyboard", "mouse", "accelerometer", "sensor")
+_GAMEPAD_HINTS = (
+    "controller", "gamepad", "xbox", "dualsense", "dualshock", "wireless", "f310", "f710", "ps4", "ps5",
+)
+# The layout every mapping above assumes: 2 sticks + 2 analog triggers as axes.
+MIN_AXES = 6
+MIN_BUTTONS = 10
+
+
+def _gamepad_score(name: str, num_axes: int, num_buttons: int) -> int:
+    lowered = name.lower()
+    score = 0
+    if num_axes >= MIN_AXES and num_buttons >= MIN_BUTTONS:
+        score += 2
+    if any(hint in lowered for hint in _GAMEPAD_HINTS):
+        score += 1
+    if any(bad in lowered for bad in _NOT_A_GAMEPAD):
+        score -= 3
+    return score
+
+
+def open_best_joystick(pygame, preferred_index: int | None = None):
+    """Open the connected device most likely to be the real gamepad.
+
+    Logs every detected device so a wrong pick is diagnosable from the LeLab
+    log alone. `preferred_index` (an explicit config choice) wins when valid;
+    otherwise the best-scoring device does, ties going to the lowest index.
+    Raises RuntimeError when nothing is connected.
+    """
+    count = pygame.joystick.get_count()
+    if count == 0:
+        raise RuntimeError(
+            "No gamepad detected. Connect a controller and try again. If you just paired "
+            "it over Bluetooth, wait a few seconds after pairing completes, then retry."
+        )
+
+    devices = []
+    for index in range(count):
+        joystick = pygame.joystick.Joystick(index)
+        joystick.init()
+        name = joystick.get_name()
+        axes, buttons, hats = joystick.get_numaxes(), joystick.get_numbuttons(), joystick.get_numhats()
+        logger.info("Controller #%d: %r (%d axes, %d buttons, %d hats)", index, name, axes, buttons, hats)
+        devices.append((_gamepad_score(name, axes, buttons), index, joystick))
+
+    if preferred_index is not None and 0 <= preferred_index < count:
+        chosen = devices[preferred_index][2]
+    else:
+        chosen = max(devices, key=lambda d: (d[0], -d[1]))[2]
+    for _, _, joystick in devices:
+        if joystick is not chosen:
+            joystick.quit()
+
+    if chosen.get_numaxes() < MIN_AXES:
+        logger.warning(
+            "Gamepad %r reports only %d axes (expected %d) -- controls on missing axes (usually the "
+            "L2/R2 triggers, i.e. the claw) won't respond. On a Logitech F310/F710, set the switch on "
+            "the back to X, not D.",
+            chosen.get_name(),
+            chosen.get_numaxes(),
+            MIN_AXES,
+        )
+    return chosen
+
+
+def read_axis(js, index: int, default: float = 0.0) -> float:
+    """get_axis() that returns `default` for an axis this controller doesn't
+    have, instead of raising -- a raise inside get_action() reads as "the
+    controller dropped" and sends the session into an endless reconnect loop.
+    Triggers pass default=-1.0 (their released position)."""
+    return js.get_axis(index) if index < js.get_numaxes() else default
+
+
+def read_button(js, index: int) -> bool:
+    """get_button() that treats a button this controller doesn't have as
+    unpressed -- see read_axis()."""
+    return bool(js.get_button(index)) if index < js.get_numbuttons() else False
+
+
 def get_dpad_delta(js) -> float:
     """+1 for D-pad up, -1 for down, 0 otherwise -- works whether the controller
     reports the D-pad as a hat (most Xbox-layout pads) or as buttons (DualSense).
@@ -105,20 +189,30 @@ def get_dpad_delta(js) -> float:
         return float(hat_y)
 
     dpad_delta = 0.0
-    if js.get_button(BUTTON_DPAD_UP):
+    if read_button(js, BUTTON_DPAD_UP):
         dpad_delta += 1.0
-    if js.get_button(BUTTON_DPAD_DOWN):
+    if read_button(js, BUTTON_DPAD_DOWN):
         dpad_delta -= 1.0
     return dpad_delta
 
 
-def step_targets(js, current_targets: dict[str, float], dt: float) -> dict[str, float]:
+def step_targets(
+    js, current_targets: dict[str, float], dt: float, gripper_override: float | None = None
+) -> dict[str, float]:
     """Advance current_targets by one control-loop tick based on live stick/trigger state.
 
     Mutates and returns current_targets.
+
+    `gripper_override`, when not None, is a 0-100 target set by something other
+    than this controller's own triggers (e.g. the K12 app's Lesson 4.2
+    browser-side hand-gesture classifier, via
+    GamepadSO101Teleop.set_gripper_override()) -- the gripper then ramps
+    toward it at the same max rate L2/R2 would use, instead of reading L2/R2
+    at all, while every other joint keeps taking gamepad input exactly as
+    usual.
     """
     for joint, cfg in JOINT_CONFIG.items():
-        raw = apply_deadzone(js.get_axis(cfg["axis"]), cfg.get("deadzone", DEADZONE))
+        raw = apply_deadzone(read_axis(js, cfg["axis"]), cfg.get("deadzone", DEADZONE))
         vel = cfg["sign"] * raw * cfg["max_deg_per_s"]
         new_val = current_targets[joint] + vel * dt
         current_targets[joint] = max(JOINT_MIN_DEG, min(JOINT_MAX_DEG, new_val))
@@ -129,11 +223,52 @@ def step_targets(js, current_targets: dict[str, float], dt: float) -> dict[str, 
         new_val = current_targets["wrist_flex"] + vel * dt
         current_targets["wrist_flex"] = max(JOINT_MIN_DEG, min(JOINT_MAX_DEG, new_val))
 
-    l2 = (js.get_axis(AXIS_L2) + 1.0) / 2.0  # 0 (released) .. 1 (pressed)
-    r2 = (js.get_axis(AXIS_R2) + 1.0) / 2.0
-    gripper_vel = GRIPPER_SIGN * (r2 - l2) * GRIPPER_MAX_PER_S
-    new_gripper = current_targets["gripper"] + gripper_vel * dt
-    current_targets["gripper"] = max(0.0, min(100.0, new_gripper))
+    if gripper_override is not None:
+        current = current_targets["gripper"]
+        max_step = GRIPPER_MAX_PER_S * dt
+        if abs(gripper_override - current) <= max_step:
+            current_targets["gripper"] = gripper_override
+        else:
+            current_targets["gripper"] = current + (max_step if gripper_override > current else -max_step)
+    else:
+        l2 = (read_axis(js, AXIS_L2, -1.0) + 1.0) / 2.0  # 0 (released) .. 1 (pressed)
+        r2 = (read_axis(js, AXIS_R2, -1.0) + 1.0) / 2.0
+        gripper_vel = GRIPPER_SIGN * (r2 - l2) * GRIPPER_MAX_PER_S
+        new_gripper = current_targets["gripper"] + gripper_vel * dt
+        current_targets["gripper"] = max(0.0, min(100.0, new_gripper))
+
+    return current_targets
+
+
+def step_targets_mapped(
+    js,
+    current_targets: dict[str, float],
+    dt: float,
+    mapping: dict[str, str],
+    gripper_override: float | None = None,
+) -> dict[str, float]:
+    """step_targets() driven by a gamepad mapping (see gamepad_mapping.py)
+    instead of the fixed layout. The default mapping moves every joint exactly
+    as step_targets() does. Mutates and returns current_targets."""
+    from .gamepad_mapping import InputReader, joint_velocities
+
+    velocities = joint_velocities(InputReader(js), mapping)
+    for joint, vel in velocities.items():
+        if joint == "gripper":
+            continue
+        new_val = current_targets[joint] + vel * dt
+        current_targets[joint] = max(JOINT_MIN_DEG, min(JOINT_MAX_DEG, new_val))
+
+    if gripper_override is not None:
+        current = current_targets["gripper"]
+        max_step = GRIPPER_MAX_PER_S * dt
+        if abs(gripper_override - current) <= max_step:
+            current_targets["gripper"] = gripper_override
+        else:
+            current_targets["gripper"] = current + (max_step if gripper_override > current else -max_step)
+    elif "gripper" in velocities:
+        new_gripper = current_targets["gripper"] + velocities["gripper"] * dt
+        current_targets["gripper"] = max(0.0, min(100.0, new_gripper))
 
     return current_targets
 
@@ -158,7 +293,9 @@ class GamepadSO101TeleopConfig(TeleoperatorConfig):
     """
 
     fps: int = FPS
-    joystick_index: int = 0
+    # None = auto-pick the most gamepad-like device (see open_best_joystick);
+    # set an index only to force a specific one.
+    joystick_index: int | None = None
     id: str = field(default="gamepad")
 
 
@@ -196,6 +333,21 @@ class GamepadSO101Teleop(Teleoperator):
         # of retrying a slow Joystick() open every single control tick.
         self._gamepad_connected = True
         self._last_reconnect_attempt = 0.0
+        # External claw command (0-100), set via set_gripper_override() -- see
+        # step_targets(). None means "L2/R2 drive the gripper", the original
+        # behavior; used by the K12 app's Lesson 4.2 hand-gesture claw control
+        # to take over just this one axis while gamepad input keeps driving
+        # every other joint.
+        self._gripper_override: float | None = None
+        # Replaced by the saved mapping in connect().
+        from .gamepad_mapping import DEFAULT_MAPPING
+
+        self._mapping: dict[str, str] = dict(DEFAULT_MAPPING)
+        # Recording-only commands (end / re-record episode): a recording
+        # session sets this to forward them to its own handlers. None
+        # outside a recording, where they do nothing.
+        self._command_handler = None
+        self._held_commands: set[str] = set()
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -225,14 +377,15 @@ class GamepadSO101Teleop(Teleoperator):
             pygame.joystick.quit()
             pygame.joystick.init()
             pygame.event.pump()
-        if pygame.joystick.get_count() == 0:
-            raise RuntimeError(
-                "No gamepad detected. Connect a controller and try again. If you just paired "
-                "it over Bluetooth, wait a few seconds after pairing completes, then retry."
-            )
-        self._joystick = pygame.joystick.Joystick(self.config.joystick_index)
-        self._joystick.init()
+        self._joystick = open_best_joystick(pygame, self.config.joystick_index)
         logger.info(f"Gamepad connected: {self._joystick.get_name()}")
+        # Which control drives what (K12 lessons' Reconfigure). Read once per
+        # session, so a saved change applies from the next Start Control.
+        from .gamepad_mapping import DEFAULT_MAPPING, load_mapping
+
+        self._mapping = load_mapping()
+        if self._mapping != DEFAULT_MAPPING:
+            logger.info("Using a custom gamepad mapping: %s", self._mapping)
 
     @property
     def is_calibrated(self) -> bool:
@@ -255,6 +408,7 @@ class GamepadSO101Teleop(Teleoperator):
         self._targets = dict(present)
         self._home_position = dict(present)
         self._running = False
+        self._gripper_override = None
 
     def _attempt_reconnect(self) -> bool:
         """Try to re-open the joystick after a drop. Rate-limited by
@@ -275,8 +429,8 @@ class GamepadSO101Teleop(Teleoperator):
             pygame.event.pump()
             if pygame.joystick.get_count() == 0:
                 return False
-            joystick = pygame.joystick.Joystick(self.config.joystick_index)
-            joystick.init()
+            # Re-picked, not re-opened by index: unplug/replug can reorder devices.
+            joystick = open_best_joystick(pygame, self.config.joystick_index)
             joystick.get_axis(0)  # confirms the handle actually reads, not just opens
         except Exception:
             return False
@@ -303,11 +457,26 @@ class GamepadSO101Teleop(Teleoperator):
         pygame = self._pygame
         try:
             pygame.event.pump()
+            from .gamepad_mapping import InputReader, command_pressed
 
-            if self._joystick.get_button(BUTTON_QUIT):
-                self._quit_requested = True
+            mapping = self._mapping
+            reader = InputReader(self._joystick)
+            # Nothing to press Start/Pause with: run straight away instead of
+            # leaving the arm unable to ever start.
+            if not mapping.get("start_pause") and not self._running:
+                self._running = True
 
-            if self._joystick.get_button(BUTTON_START_PAUSE):
+            # Recording commands fire once per press (not every tick held).
+            for command in ("end_episode", "rerecord_episode"):
+                if command_pressed(reader, mapping, command):
+                    if command not in self._held_commands:
+                        self._held_commands.add(command)
+                        if self._command_handler is not None:
+                            self._command_handler(command)
+                else:
+                    self._held_commands.discard(command)
+
+            if command_pressed(reader, mapping, "start_pause"):
                 if not self._start_pause_held:
                     self._start_pause_held = True
                     self._running = not self._running
@@ -317,7 +486,7 @@ class GamepadSO101Teleop(Teleoperator):
             else:
                 self._start_pause_held = False
 
-            if self._joystick.get_button(BUTTON_HOME):
+            if command_pressed(reader, mapping, "home"):
                 if not self._home_held:
                     self._home_held = True
                     if self._running and self._robot is not None:
@@ -332,7 +501,7 @@ class GamepadSO101Teleop(Teleoperator):
             self._last_tick = now
 
             if self._running:
-                step_targets(self._joystick, self._targets, dt)
+                step_targets_mapped(self._joystick, self._targets, dt, mapping, self._gripper_override)
         except Exception as e:
             # The controller went away mid-read (Bluetooth hiccup, dongle out
             # of range, USB unplug). Freeze the arm in place -- force
@@ -346,6 +515,22 @@ class GamepadSO101Teleop(Teleoperator):
             self._home_held = False
 
         return {f"{joint}.pos": val for joint, val in self._targets.items()}
+
+    def set_command_handler(self, handler) -> None:
+        """Forward the recording commands (``end_episode``,
+        ``rerecord_episode``) to ``handler(name)``; None turns them off."""
+        self._command_handler = handler
+
+    def set_gripper_override(self, value: float | None) -> None:
+        """Take over the gripper axis with an external 0-100 target (or pass
+        None to release it back to L2/R2). See step_targets() for how this is
+        applied -- ramped at the same max rate trigger input would use, not
+        snapped. Safe to call whether or not teleoperation is currently
+        running; a paused session (Cross not pressed) just holds the override
+        value in place until motion resumes, same as it would hold any other
+        target.
+        """
+        self._gripper_override = None if value is None else max(0.0, min(100.0, value))
 
     def get_teleop_events(self) -> dict[str, Any]:
         """Extra button state the web layer polls independently of get_action()
@@ -380,4 +565,5 @@ class GamepadSO101Teleop(Teleoperator):
             self._pygame = None
         self._targets = None
         self._robot = None
+        self._gripper_override = None
         logger.info("Gamepad disconnected.")

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +36,24 @@ def _is_dataset_dir(path: Path) -> bool:
         return (path / "meta" / "info.json").is_file()
     except OSError:
         return False
+
+
+def local_dataset_episode_count(path: Path) -> int | None:
+    """total_episodes from <dir>/meta/info.json, or None if unreadable."""
+    try:
+        with open(path / "meta" / "info.json", encoding="utf-8") as f:
+            count = json.load(f).get("total_episodes")
+        return count if isinstance(count, int) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _has_recorded_episodes(path: Path) -> bool:
+    """A recording that failed before its first episode (camera wouldn't
+    open, stopped right away...) still leaves meta/info.json behind with 0
+    episodes. Listing those lets someone pick one to train on, which then
+    fails with a confusing Hub 401 -- so leave them out."""
+    return local_dataset_episode_count(path) != 0
 
 
 def _dir_mtime_iso(path: Path) -> str | None:
@@ -71,6 +90,8 @@ def list_local_datasets() -> list[dict[str, Any]]:
             continue
 
         if _is_dataset_dir(top):
+            if not _has_recorded_episodes(top):
+                continue
             out.append(
                 {
                     "repo_id": top.name,
@@ -91,7 +112,7 @@ def list_local_datasets() -> list[dict[str, Any]]:
                     continue
             except OSError:
                 continue
-            if _is_dataset_dir(sub):
+            if _is_dataset_dir(sub) and _has_recorded_episodes(sub):
                 out.append(
                     {
                         "repo_id": f"{top.name}/{sub.name}",

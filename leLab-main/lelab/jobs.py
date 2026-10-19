@@ -107,6 +107,22 @@ class JobCheckpoint(BaseModel):
     ref: str
 
 
+_LOG_TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+
+def _log_line_time(message: str, received_at: float) -> float:
+    """When a log line was written: lerobot prefixes its lines with
+    'INFO 2026-10-09 00:00:55 ...'. Cloud logs can reach LeLab in bursts, so
+    the line's own time is better than when LeLab received it."""
+    # The step line often follows a tqdm bar on the same line
+    # ("Training: ...step/s]INFO 2026-... step:19K"), so take the last stamp.
+    stamps = _LOG_TIME_RE.findall(message)
+    if stamps:
+        with contextlib.suppress(ValueError):
+            return datetime.strptime(stamps[-1], "%Y-%m-%d %H:%M:%S").timestamp()
+    return received_at
+
+
 class MetricsHistoryPoint(BaseModel):
     """One (step, metrics) sample reconstructed from a job's log.jsonl.
 
@@ -119,20 +135,27 @@ class MetricsHistoryPoint(BaseModel):
     loss: float | None = None
     lr: float | None = None
     grad_norm: float | None = None
+    # Seconds when the step was logged (from the log line's own timestamp,
+    # else when LeLab received it). Only differences between points are
+    # meaningful: a cloud run logs in the cloud machine's clock.
+    t: float | None = None
 
 
 def _pid_alive(pid: int) -> bool:
     """Return True if a process with this PID exists. Cheap; uses signal 0.
 
-    Catches OSError broadly, not just ProcessLookupError/PermissionError:
-    Windows can raise a bare OSError (e.g. WinError 87, "The parameter is
-    incorrect") for a stale/reused pid that doesn't map to either of those,
-    which would otherwise crash the whole server at startup while loading
-    old job records from disk.
+    Best-effort: on Windows, os.kill(pid, 0) against a PID that no longer
+    exists (or was recycled to something we can't signal) has been observed
+    to raise SystemError, and also a bare OSError (e.g. WinError 87, "The
+    parameter is incorrect") for other stale/reused pids -- neither is a
+    documented OSError subclass like ProcessLookupError/PermissionError, and
+    either would otherwise crash server startup entirely while loading a
+    stale job record. Treat any failure here as "can't confirm it's alive",
+    so a weird PID can never block the whole app from starting.
     """
     try:
         os.kill(pid, 0)
-    except OSError:
+    except Exception:
         return False
     return True
 
@@ -152,7 +175,10 @@ class JobRunner(Protocol):
 
 
 # tqdm progress: "Training:   1%|▏         | 125/10000 [02:02<2:36:10,  1.05step/s]"
-_TQDM_RE = re.compile(r"Training:\s*\d+%[^|]*\|[^|]*\|\s*(\d+)/(\d+)\s*\[(?:[\d:]+)<([\d:]+)")
+_TQDM_RE = re.compile(r"Training:\s*\d+%[^|]*\|[^|]*\|\s*(\d+)/(\d+)\s*\[([\d:]+)<([\d:]+)")
+# Steps before the time-left estimate switches from tqdm's own guess to the
+# run's average speed (the first steps include warm-up).
+_STEADY_ETA_AFTER_STEPS = 50
 
 # Wandb prints something like "wandb: 🚀 View run at https://wandb.ai/<entity>/<project>/runs/<id>"
 # when it boots. We capture the first URL of that shape we see.
@@ -193,7 +219,15 @@ def parse_metrics_into(line: str, metrics: TrainingMetrics) -> None:
                 total = int(tqdm_match.group(2))
                 if total > 0:
                     metrics.total_steps = total
-                eta = _parse_duration(tqdm_match.group(3))
+                # tqdm's own estimate follows the last few steps, so one slow
+                # step (e.g. while a log or checkpoint is written) made "time
+                # left" jump from 45 minutes to 2.5 hours and back. Use the
+                # average speed of the run so far instead, once there is one.
+                current = metrics.current_step or 0
+                elapsed = _parse_duration(tqdm_match.group(3))
+                eta = _parse_duration(tqdm_match.group(4))
+                if elapsed is not None and current >= _STEADY_ETA_AFTER_STEPS and total > current:
+                    eta = elapsed / current * (total - current)
                 if eta is not None:
                     metrics.eta_seconds = eta
             except (ValueError, IndexError):
@@ -245,6 +279,11 @@ class SubprocessJobRunner:
         write; _consume_lines closes it when its iterator is exhausted."""
         if self._log_file_path is not None:
             self._log_file_path.parent.mkdir(parents=True, exist_ok=True)
+            # Explicit UTF-8: same reasoning as the subprocess decode above --
+            # without it this defaults to the Windows system locale (cp1252),
+            # which can't represent every character a training subprocess's
+            # output might legitimately contain (e.g. tqdm's Unicode
+            # block-drawing characters).
             self._log_file = self._log_file_path.open("a", buffering=1, encoding="utf-8")
 
     def _spawn(self, cmd: list[str], thread_name: str) -> None:
@@ -258,6 +297,13 @@ class SubprocessJobRunner:
         # block-buffering hides log lines from our parser for many seconds.
         child_env = os.environ.copy()
         child_env["PYTHONUNBUFFERED"] = "1"
+        # Windows: a child whose output goes to a file writes in the old
+        # cp1252 charset, and lerobot's pi0/pi0.5 loader prints a check mark
+        # after reading the weights. That print raised, lerobot caught it and
+        # carried on WITHOUT the trained weights (a random model). UTF-8 output
+        # avoids it.
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
 
         # start_new_session=True puts the child in its own session/process
         # group. Without it, signals sent to the uvicorn worker (e.g. when
@@ -269,6 +315,18 @@ class SubprocessJobRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True,
+            # Without an explicit encoding, Windows decodes the child's stdout
+            # bytes using the system locale (cp1252 here), not UTF-8. tqdm's
+            # progress bar uses Unicode block-drawing characters once it has
+            # rendered enough resolution to need a partial-fill glyph, which
+            # aren't valid cp1252 -- decoding then raises UnicodeDecodeError,
+            # silently killing this thread's readline() loop with nothing left
+            # to drain the pipe. The child then eventually blocks trying to
+            # write further output once the OS pipe buffer fills, which looks
+            # exactly like training itself hanging. errors="replace" is a
+            # second line of defense against any other undecodable byte.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             env=child_env,
             start_new_session=True,
@@ -593,8 +651,9 @@ _HUB_CKPT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@checkpoints/(?P<step_dir>\d+)$"
 _HUB_ROOT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@root$")
 
 
-def _read_checkpoint_config(ckpt: JobCheckpoint) -> dict[str, object]:
-    """Load the pretrained_model/config.json for one checkpoint.
+def _read_checkpoint_config(ckpt: JobCheckpoint, name: str = "config.json") -> dict[str, object]:
+    """Load one JSON file (default config.json) from a checkpoint's
+    pretrained_model dir.
 
     Keyed on the checkpoint's own source/ref shape so it works for training
     jobs and imports alike:
@@ -603,23 +662,51 @@ def _read_checkpoint_config(ckpt: JobCheckpoint) -> dict[str, object]:
                  model repo); both resolve via hf_hub_download.
     """
     if ckpt.source == "local":
-        with open(Path(ckpt.ref) / "config.json", encoding="utf-8") as f:
+        with open(Path(ckpt.ref) / name, encoding="utf-8") as f:
             return json.load(f)
     from huggingface_hub import hf_hub_download
 
     m = _HUB_CKPT_REF_RE.match(ckpt.ref)
     if m:
         repo_id = m.group("repo")
-        filename = f"checkpoints/{m.group('step_dir')}/pretrained_model/config.json"
+        filename = f"checkpoints/{m.group('step_dir')}/pretrained_model/{name}"
     else:
         m = _HUB_ROOT_REF_RE.match(ckpt.ref)
         if not m:
             raise ValueError(f"Bad hub ref: {ckpt.ref!r}")
         repo_id = m.group("repo")
-        filename = "config.json"
+        filename = name
     local_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="model")
-    with open(local_path) as f:
+    with open(local_path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _robot_cameras_for(ckpt: JobCheckpoint, policy_cameras: list[str]) -> tuple[list[str] | None, str | None]:
+    """The robot camera names a checkpoint needs at run time, plus the dataset
+    it was trained on, from its train_config.json (which travels with the
+    model, so this works on any computer).
+
+    A model fine-tuned from a pretrained checkpoint keeps that checkpoint's
+    camera names (smolvla_base: camera1/2/3) and was trained through a
+    rename_map pairing the dataset's cameras onto them -- e.g. top -> camera1,
+    wrist -> camera2, camera3 unused. What the robot needs then is the
+    dataset's cameras, not cameras literally called camera1-3. Without a
+    rename_map the policy's own names are the robot's.
+    Returns (None, None) when train_config.json can't be read.
+    """
+    try:
+        train_cfg = _read_checkpoint_config(ckpt, "train_config.json")
+    except Exception:
+        return None, None
+    dataset_cfg = train_cfg.get("dataset") if isinstance(train_cfg.get("dataset"), dict) else {}
+    dataset_repo_id = dataset_cfg.get("repo_id") if isinstance(dataset_cfg.get("repo_id"), str) else None
+    rename_map = train_cfg.get("rename_map") or {}
+    if not isinstance(rename_map, dict) or not rename_map:
+        return list(policy_cameras), dataset_repo_id
+    short = lambda key: str(key).split(".")[-1]  # noqa: E731
+    mapped_to = {short(policy): short(dataset) for dataset, policy in rename_map.items()}
+    cameras = [mapped_to[name] for name in policy_cameras if name in mapped_to]
+    return (cameras or list(policy_cameras)), dataset_repo_id
 
 
 def _generate_job_id(policy_type: str, dataset_repo_id: str) -> str:
@@ -963,7 +1050,9 @@ class JobRegistry:
         if not path.exists():
             return []
         out: list[LogLine] = []
-        with path.open() as f:
+        # log.jsonl is UTF-8 (tqdm bars etc.); Windows' default cp1252 can't
+        # decode it and the whole read used to fail with a 500.
+        with path.open(encoding="utf-8", errors="replace") as f:
             for raw in f:
                 raw = raw.strip()
                 if not raw:
@@ -988,7 +1077,9 @@ class JobRegistry:
         if not path.exists():
             return []
         points: list[MetricsHistoryPoint] = []
-        with path.open() as f:
+        # log.jsonl is UTF-8 (tqdm bars etc.); Windows' default cp1252 can't
+        # decode it and the whole read used to fail with a 500.
+        with path.open(encoding="utf-8", errors="replace") as f:
             for raw in f:
                 raw = raw.strip()
                 if not raw:
@@ -1012,6 +1103,7 @@ class JobRegistry:
                     loss=fresh.current_loss,
                     lr=fresh.current_lr,
                     grad_norm=fresh.grad_norm,
+                    t=_log_line_time(msg, log_line.timestamp),
                 )
                 # Dedupe by step: overwrite on consecutive same-step lines.
                 if points and points[-1].step == point.step:
@@ -1090,9 +1182,14 @@ class JobRegistry:
             # takes just the suffix.
             name = full_name.split(".")[-1]
             image_features[name] = {"height": int(height), "width": int(width)}
+        robot_cameras, dataset_repo_id = _robot_cameras_for(match, list(image_features))
         return {
             "policy_type": policy_type,
             "image_features": image_features,
+            # The robot cameras to run it with (see _robot_cameras_for);
+            # None when the checkpoint has no readable train_config.json.
+            "robot_cameras": robot_cameras,
+            "dataset_repo_id": dataset_repo_id,
             "requires_task": policy_type in _LANGUAGE_CONDITIONED_POLICY_TYPES,
         }
 

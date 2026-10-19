@@ -37,7 +37,7 @@ from starlette.responses import Response
 from starlette.types import Scope
 
 # Import our custom recording functionality
-from . import datasets as dataset_browser, record as _record
+from . import camera_preview, datasets as dataset_browser, record as _record
 
 # Import our custom calibration functionality
 from .calibrate import CalibrationRequest, calibration_manager
@@ -72,11 +72,23 @@ from .rollout import (
 
 # Import our custom teleoperation functionality
 from .teleoperate import (
+    GripperOverrideRequest,
     TeleoperateRequest,
     handle_get_joint_positions,
+    handle_set_gripper_override,
     handle_start_teleoperation,
     handle_stop_teleoperation,
     handle_teleoperation_status,
+)
+
+# Standalone real-arm gripper preview -- see lelab/gripper_preview.py.
+from .claw_setup import ClawServoSetupRequest, handle_claw_servo_status, handle_setup_claw_servo
+from .gripper_preview import (
+    GripperPreviewPositionRequest,
+    StartGripperPreviewRequest,
+    handle_set_gripper_preview_position,
+    handle_start_gripper_preview,
+    handle_stop_gripper_preview,
 )
 
 # Training is now job-based; see app/jobs.py.
@@ -327,6 +339,50 @@ def get_joint_positions():
     return handle_get_joint_positions()
 
 
+@app.post("/gripper-override")
+def gripper_override(request: GripperOverrideRequest):
+    """Let something other than the gamepad's own triggers drive the gripper
+    (Lesson 4.2's browser-side hand-gesture claw control) during an active
+    gamepad teleoperation session. Pass value: null to release it back to
+    L2/R2."""
+    return handle_set_gripper_override(request)
+
+
+@app.post("/claw/servo-status")
+def claw_servo_status(request: ClawServoSetupRequest):
+    """Read-only: is the claw on this port already on its own servo ID?"""
+    return handle_claw_servo_status(request)
+
+
+@app.post("/claw/setup-servo")
+def setup_claw_servo(request: ClawServoSetupRequest):
+    """One-time: move the standalone claw's servo (the only one plugged in)
+    onto its own ID, so it can never be confused with the arm's gripper --
+    see lelab/claw_setup.py."""
+    return handle_setup_claw_servo(request)
+
+
+@app.post("/start-gripper-preview")
+def start_gripper_preview(request: StartGripperPreviewRequest):
+    """Connect just the gripper for on-demand control, independent of a full
+    teleoperation session (which, in gamepad mode, requires a physical
+    controller to even connect) -- Lesson 4.1's real-claw gesture preview."""
+    return handle_start_gripper_preview(request)
+
+
+@app.post("/gripper-preview-position")
+def gripper_preview_position(request: GripperPreviewPositionRequest):
+    """Move the gripper connected via /start-gripper-preview to a 0-100
+    position."""
+    return handle_set_gripper_preview_position(request)
+
+
+@app.post("/stop-gripper-preview")
+def stop_gripper_preview():
+    """Disconnect the gripper preview started via /start-gripper-preview."""
+    return handle_stop_gripper_preview()
+
+
 @app.get("/gamepad-status")
 def gamepad_status():
     """Live gamepad detection + axis/button/hat values, independent of any
@@ -336,6 +392,7 @@ def gamepad_status():
 
 @app.post("/start-inference")
 def start_inference(request: InferenceRequest):
+    camera_preview.stop_all_previews()  # release cameras the run needs
     result = handle_start_inference(request)
     if not result.get("success"):
         raise HTTPException(
@@ -354,6 +411,39 @@ def stop_inference():
             detail=result.get("message", "Failed to stop inference"),
         )
     return result
+
+
+class RemoteServerRequest(BaseModel):
+    policy_ref: str
+    flavor: str | None = None
+
+
+@app.post("/remote-server/start")
+def remote_server_start(request: RemoteServerRequest):
+    """Start the cloud GPU that runs a cloud training's checkpoint for the arm."""
+    from . import remote_server
+
+    try:
+        return remote_server.start(request.policy_ref, request.flavor or remote_server.DEFAULT_FLAVOR)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not start the cloud GPU")
+        raise HTTPException(status_code=502, detail=f"Could not start the cloud GPU: {exc}") from exc
+
+
+@app.get("/remote-server/status")
+def remote_server_status():
+    from . import remote_server
+
+    return remote_server.status()
+
+
+@app.post("/remote-server/stop")
+def remote_server_stop():
+    from . import remote_server
+
+    return remote_server.stop()
 
 
 @app.get("/inference-status")
@@ -436,6 +526,7 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.post("/start-recording")
 def start_recording(request: RecordingRequest):
     """Start a dataset recording session"""
+    camera_preview.stop_all_previews()  # release cameras the recording needs
     return handle_start_recording(request)
 
 
@@ -449,6 +540,63 @@ def stop_recording():
 def recording_status():
     """Get the current recording status"""
     return handle_recording_status()
+
+
+class GamepadMappingBody(BaseModel):
+    mapping: dict[str, str | None]
+
+
+@app.get("/gamepad-mapping")
+def get_gamepad_mapping():
+    """The saved control -> action mapping (K12 lessons' Reconfigure), plus the
+    default and the valid action / input names."""
+    from . import gamepad_mapping as gm
+
+    return {
+        "mapping": gm.load_mapping(),
+        "default": gm.DEFAULT_MAPPING,
+        "actions": list(gm.ACTIONS),
+        "inputs": list(gm.INPUTS),
+    }
+
+
+@app.put("/gamepad-mapping")
+def put_gamepad_mapping(body: GamepadMappingBody):
+    """Save a new mapping. Applies from the next Start Control / recording."""
+    from . import gamepad_mapping as gm
+
+    try:
+        return {"success": True, "mapping": gm.save_mapping(body.mapping)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/gamepad-mapping/reset")
+def reset_gamepad_mapping():
+    from . import gamepad_mapping as gm
+
+    return {"success": True, "mapping": gm.reset_mapping()}
+
+
+@app.get("/camera-preview/{index}")
+def camera_preview_feed(index: int):
+    """Live low-res MJPEG preview of camera `index` while nothing else uses
+    the cameras -- for cameras the browser can't list itself (see
+    camera_preview.py). Ends when recording or a policy run starts."""
+    from . import rollout as _rollout
+
+    def blocked() -> bool:
+        # Only while a recording actually holds the cameras: after it
+        # disconnects them it may still be finalizing or uploading for minutes.
+        recording_holds_cameras = _record.recording_active and not _record.cameras_released
+        return recording_holds_cameras or _rollout.inference_active
+
+    if blocked():
+        raise HTTPException(status_code=409, detail="Cameras are in use by a recording or policy run")
+    return StreamingResponse(
+        camera_preview.preview_frames(index, blocked),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 @app.get("/camera-feed/{cam_key}")
@@ -465,6 +613,16 @@ def camera_feed(cam_key: str):
         _record.camera_feed_frames(cam_key),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+class DeleteEpisodeRequest(BaseModel):
+    episode: int  # 1-based, as shown in the recording status
+
+
+@app.post("/recording-delete-episode")
+def recording_delete_episode(request: DeleteEpisodeRequest):
+    """Delete an already-saved episode of the running recording session."""
+    return _record.handle_delete_episode(request.episode)
 
 
 @app.post("/recording-exit-early")
@@ -497,10 +655,91 @@ def list_local_datasets_endpoint():
     return handle_list_local_datasets()
 
 
+class DeleteDatasetRequest(BaseModel):
+    dataset_repo_id: str
+    # The copy on this computer (skipped quietly when there is none).
+    delete_local: bool = True
+    # The copy on Hugging Face. Off unless the user explicitly asked for it.
+    delete_hub: bool = False
+
+
+def _delete_hub_dataset(repo_id: str) -> str | None:
+    return _delete_hub_repo(repo_id, "dataset")
+
+
+def _delete_hub_repo(repo_id: str, repo_type: str) -> str | None:
+    """Delete a dataset or model repo from the user's Hugging Face account.
+    Returns an error message, or None on success (also when it was already
+    gone)."""
+    from huggingface_hub.errors import HfHubHTTPError
+
+    noun = "dataset" if repo_type == "dataset" else "model"
+
+    info = cached_whoami()
+    if info is None:
+        return "You are not logged in to Hugging Face on this computer."
+    owners = {info.get("name")} | {
+        o.get("name") for o in info.get("orgs", []) or [] if isinstance(o, dict)
+    }
+    # A renamed account keeps redirecting its old name (e.g. a record saved
+    # as "oldname/model"): check and delete under the repo's current name.
+    try:
+        repo_id = shared_hf_api().repo_info(repo_id, repo_type=repo_type).id
+    except HfHubHTTPError as e:
+        if getattr(getattr(e, "response", None), "status_code", None) == 404:
+            return None
+    except Exception:
+        pass
+    # Only the user's own (or their organisations') repos, never anyone else's.
+    if "/" not in repo_id or repo_id.split("/", 1)[0] not in owners:
+        return f"This {noun} does not belong to your Hugging Face account, so it can't be deleted from here."
+    try:
+        shared_hf_api().delete_repo(repo_id, repo_type=repo_type)
+    except HfHubHTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 404:
+            return None
+        if status in (401, 403):
+            return f"Your Hugging Face token is not allowed to delete {noun}s. It needs write access."
+        logger.error(f"Failed to delete Hub {noun} {repo_id}: {e}")
+        return f"Hugging Face refused: {e}"
+    except Exception as e:  # network down, etc.
+        logger.error(f"Failed to delete Hub {noun} {repo_id}: {e}")
+        return f"Could not reach Hugging Face: {e}"
+    logger.info(f"Deleted Hub {noun} {repo_id}")
+    return None
+
+
 @app.post("/delete-dataset")
-def delete_dataset(request: DatasetInfoRequest):
-    """Remove a recorded dataset directory from local disk."""
-    return handle_delete_dataset(request)
+def delete_dataset(request: DeleteDatasetRequest):
+    """Remove a recorded dataset from local disk and, only when asked
+    (delete_hub), from the user's Hugging Face account too."""
+    from pathlib import Path
+
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    repo_id = request.dataset_repo_id
+    # Deleting files out from under a recording or a training run crashes it.
+    if _record.recording_active:
+        return {"success": False, "message": "Stop the recording before deleting a dataset."}
+    for job in job_registry.list(limit=1000):
+        if job.state == "running" and job.config.dataset_repo_id == repo_id:
+            return {"success": False, "message": "This dataset is being trained on. Stop training first."}
+
+    deleted: list[str] = []
+    local_exists = (Path(HF_LEROBOT_HOME) / repo_id).exists()
+    if request.delete_local and (local_exists or not request.delete_hub):
+        result = handle_delete_dataset(DatasetInfoRequest(dataset_repo_id=repo_id))
+        if not result.get("success"):
+            return result
+        deleted.append("this computer")
+    if request.delete_hub:
+        error = _delete_hub_dataset(repo_id)
+        if error:
+            prefix = "Deleted from this computer, but not from Hugging Face. " if deleted else ""
+            return {"success": False, "message": prefix + error, "deleted_from": deleted}
+        deleted.append("Hugging Face")
+    return {"success": True, "message": f"Deleted {repo_id}", "deleted_from": deleted}
 
 
 # ============================================================================
@@ -685,13 +924,36 @@ def stop_job(job_id: str):
 
 
 @app.delete("/jobs/{job_id}", status_code=204)
-def delete_job(job_id: str):
+def delete_job(job_id: str, delete_hub: bool = False):
+    """Delete a training. With delete_hub, a cloud training's model repo on
+    Hugging Face (its checkpoints) is deleted first; if that fails, nothing
+    is deleted so it can be retried."""
+    if delete_hub:
+        try:
+            record = job_registry.get(job_id)
+        except JobNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
+        if record.state == "running":
+            raise HTTPException(status_code=409, detail=f"Job {job_id!r} is running; stop it first")
+        # Only repos a cloud run of ours created; an imported model may be
+        # someone else's (the ownership check in _delete_hub_repo also guards).
+        if record.runner == "hf_cloud" and record.hf_repo_id:
+            error = _delete_hub_repo(record.hf_repo_id, "model")
+            if error:
+                raise HTTPException(status_code=502, detail=error)
     try:
         job_registry.delete(job_id)
     except JobNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
     except JobNotRunningError as exc:
         raise HTTPException(status_code=409, detail=f"Job {job_id!r} is running; stop it first") from exc
+    except OSError as exc:
+        # Windows: a file in the run folder is still open (e.g. the AI is
+        # running from this model).
+        raise HTTPException(
+            status_code=409,
+            detail=f"Some files of this training are in use and could not be deleted. Stop any AI run and try again. ({exc})",
+        ) from exc
 
 
 @app.get("/jobs/runners/hardware")
@@ -844,6 +1106,14 @@ def calibration_status():
 def complete_calibration_step():
     """Complete the current calibration step"""
     return calibration_manager.complete_step()
+
+
+@app.post("/retry-calibration-step")
+def retry_calibration_step():
+    """Retry the motor currently stuck in a "motor_error" state -- redoes
+    just that motor's homing + range recording, leaving every other
+    already-completed motor's calibration untouched."""
+    return calibration_manager.retry_current_step()
 
 
 @app.get("/calibration-configs/{device_type}")
@@ -1028,6 +1298,19 @@ def _windows_cameras() -> list[dict[str, Any]]:
     frontend match each index to the browser's ``MediaDeviceInfo.label`` for the
     live preview. Falls back to generic names if pygrabber is unavailable.
     """
+    # FastAPI runs this on a worker-pool thread, and COM must be initialized
+    # per thread -- comtypes only does it for the thread that imported it, so
+    # on any other worker pygrabber failed with "CoInitialize has not been
+    # called" and every camera came back as "Camera N" (browser previews then
+    # can't be matched by name and all go blank).
+    # Left initialized on purpose: pool threads are reused, and uninitializing
+    # while comtypes objects may still be alive is what crashes.
+    import ctypes
+
+    try:
+        ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+    except Exception:
+        pass
     try:
         from pygrabber.dshow_graph import FilterGraph
 

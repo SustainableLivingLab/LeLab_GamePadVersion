@@ -23,6 +23,7 @@ bundle from the same process. Dev mode starts Vite on :8080 and uvicorn
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import logging
 import os
@@ -40,6 +41,29 @@ from typing import NoReturn
 
 import psutil
 import uvicorn
+
+# Several modules print emoji status messages (recording/reset/save progress,
+# etc.). Windows' console defaults to a legacy codepage (e.g. cp1252) that
+# can't encode them, which crashes those print() calls with a
+# UnicodeEncodeError -- including on normal, successful recording runs, not
+# just error paths. Force UTF-8 for this process, and set it in the
+# environment too so subprocesses (e.g. --dev mode's uvicorn --reload
+# supervisor) inherit it as well.
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+for _stream in (sys.stdout, sys.stderr):
+    if getattr(_stream, "encoding", "").lower() != "utf-8" and hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
+# asyncio's default ProactorEventLoop on Windows has long-standing reliability
+# issues with subprocess pipe transports under sustained I/O (the training/
+# recording subprocesses we pipe stdout from) -- symptoms range from a logged
+# "_ProactorBaseWritePipeTransport._loop_writing" exception to a subprocess's
+# output silently stopping partway through with no error at all, even though
+# the subprocess itself is still alive and running fine. SelectorEventLoop
+# doesn't share this subprocess-transport code path and is the standard
+# workaround. Must be set before uvicorn (or anything else) creates the loop.
+if os.name == "nt":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -99,11 +123,16 @@ def _find_lelab_pids() -> dict[int, str]:
     me = os.getpid()
     ports = {BACKEND_PORT, FRONTEND_DEV_PORT}
     targets: dict[int, str] = {}
-    for proc in psutil.process_iter(["pid", "cmdline"]):
+    for proc in psutil.process_iter(["pid"]):
         pid = proc.info["pid"]
         if pid == me:
             continue
-        cmdline = " ".join(proc.info.get("cmdline") or [])
+        # Read per process: asking process_iter for cmdline lets one
+        # unreadable process (WinError 87, see below) abort the whole scan.
+        try:
+            cmdline = " ".join(proc.cmdline() or [])
+        except (psutil.Error, OSError):
+            cmdline = ""
         if "lelab.server" in cmdline:
             targets[pid] = "uvicorn (lelab.server)"
             continue
@@ -112,7 +141,10 @@ def _find_lelab_pids() -> dict[int, str]:
                 if Path(proc.cwd()) == PROJECT_ROOT:
                     targets[pid] = "orphaned reload worker"
                     continue
-            except (psutil.AccessDenied, psutil.NoSuchProcess):
+            # OSError: on Windows, reading some processes fails with a raw
+            # "WinError 87 ... (originated from ReadProcessMemory)" instead of
+            # AccessDenied; it used to crash --stop. Skip those processes.
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                 pass
         try:
             get_conns = getattr(proc, "net_connections", None) or proc.connections
@@ -120,7 +152,7 @@ def _find_lelab_pids() -> dict[int, str]:
                 if conn.laddr and conn.laddr.port in ports and conn.status == psutil.CONN_LISTEN:
                     targets[pid] = f"listening on :{conn.laddr.port}"
                     break
-        except (psutil.AccessDenied, psutil.NoSuchProcess):
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
             pass
     return targets
 
@@ -367,7 +399,7 @@ def _run_prod(*, no_open: bool = False, rebuild: bool = False) -> None:
                         child.terminate()
             except Exception:
                 pass
-            os._exit(0)
+            _hard_exit()
 
         signal.signal(signal.SIGINT, _shutdown)
         for _name in ("SIGTERM", "SIGBREAK"):
@@ -377,6 +409,36 @@ def _run_prod(*, no_open: bool = False, rebuild: bool = False) -> None:
                     signal.signal(_sig, _shutdown)
 
     server.run()
+    if os.name == "nt":
+        # uvicorn finished, but a normal interpreter exit can still freeze
+        # (see _hard_exit) and keep the terminal stuck.
+        _hard_exit()
+
+
+def _hard_exit() -> None:
+    """End this process right now, even on Windows.
+
+    os._exit() still runs every loaded DLL's detach routine, and on Windows a
+    camera driver (DirectShow, used by the camera previews and recording) or
+    CUDA can block there -- LeLab then printed "Shutting down LeLab..." and
+    froze with the terminal locked. TerminateProcess skips those routines.
+    """
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        # Declared types matter: with ctypes' defaults the HANDLE gets passed
+        # as a 32-bit int, Windows sees an invalid handle, the call fails,
+        # and we'd fall through to the os._exit() that hangs.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), 0)
+        # Still here? Have Windows end us from outside.
+        with contextlib.suppress(Exception):
+            subprocess.run(["taskkill", "/F", "/PID", str(os.getpid())], capture_output=True, timeout=10)
+    os._exit(0)
 
 
 def _run_dev(*, no_open: bool = False) -> None:
