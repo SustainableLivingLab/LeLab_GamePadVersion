@@ -32,7 +32,7 @@ machine already has.
 Open PowerShell and paste:
 
 ```powershell
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install --python 3.13 "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git#subdirectory=leLab-main" --reinstall; lelab-gamepad
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { irm https://astral.sh/uv/install.ps1 | iex; $env:Path = "$HOME\.local\bin;$env:Path" }; uv tool install --python 3.13 "git+https://github.com/SustainableLivingLab/LeLab_GamePadVersion.git@pilot#subdirectory=leLab-main" --reinstall; lelab-gamepad
 ```
 
 `--reinstall` makes `uv` fetch and install the current code fresh every time you run this command,
