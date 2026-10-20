@@ -21,6 +21,50 @@ manual setup further down for anyone who wants to see the code as they go.
 
 ---
 
+## First Fresh Installation
+
+Setting this up on a brand-new laptop that's never had it (or Git) before? This section is the
+complete checklist, in order. It applies no matter what hardware (arm, gamepad) you'll connect
+later: those only matter once the app is running.
+
+### What a fresh machine needs
+
+Only two things need to be installed by hand before the one-liner below can do the rest:
+
+1. **Git**: download and install it first.
+   - Windows: <https://git-scm.com/downloads/win>
+   - macOS: <https://git-scm.com/downloads/mac>
+   - Linux: <https://git-scm.com/downloads/linux>
+
+   During install, accept the defaults (just keep clicking Next). You don't need to configure
+   anything else about it.
+
+2. **PowerShell** (Windows only): already built into Windows 10 and 11, nothing to install.
+   Open it from the Start menu by typing `powershell`. (macOS/Linux users: use your regular
+   terminal instead for every command in this guide.)
+
+That's it. Everything else, including Python itself, is installed automatically by the one-liner
+below.
+
+### Steps
+
+1. Install Git from the link above for your OS. Accept the defaults.
+2. Open PowerShell (Windows) or your terminal (macOS/Linux).
+3. Paste and run the **Quick Start** command in the next section below. On first run it installs
+   `uv`, a matching Python version, and the app itself, then starts it, all in one go.
+4. Wait for your browser to open to `http://localhost:8000` (first run takes a few minutes,
+   downloading a few hundred MB).
+5. Plug in your SO-101 follower arm and game controller (see **What you need before starting**
+   under Manual setup, below, for tested controller types), then follow **Step 5: First-time
+   setup inside the app** further down to create a robot, calibrate, and test the gamepad.
+6. If you'll be recording datasets, uploading to the Hub, or training, also log into Hugging
+   Face from inside the app: see **Logging into Hugging Face** under Troubleshooting, below.
+
+If any step here fails, jump to **Troubleshooting** further down; most issues (missing Git,
+Smart App Control blocking the exe, Python not on PATH) are already covered there with fixes.
+
+---
+
 ## Quick Start (one command)
 
 If you just want to run LeLab GamePad Version and don't plan to edit the code, this single
