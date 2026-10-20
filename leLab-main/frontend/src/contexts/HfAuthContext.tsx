@@ -17,6 +17,7 @@ export type HfAuthState =
 interface HfAuthValue {
   auth: HfAuthState;
   refetch: () => Promise<void>;
+  login: (token: string) => Promise<void>;
 }
 
 const HfAuthContext = createContext<HfAuthValue | undefined>(undefined);
@@ -59,9 +60,25 @@ export const HfAuthProvider: React.FC<{ children: ReactNode }> = ({
     fetchStatus();
   }, [fetchStatus]);
 
+  const login = useCallback(
+    async (token: string) => {
+      const response = await fetchWithHeaders(`${baseUrl}/hf-auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.detail ?? "Login failed");
+      }
+      await fetchStatus();
+    },
+    [baseUrl, fetchWithHeaders, fetchStatus]
+  );
+
   const value = useMemo(
-    () => ({ auth, refetch: fetchStatus }),
-    [auth, fetchStatus]
+    () => ({ auth, refetch: fetchStatus, login }),
+    [auth, fetchStatus, login]
   );
 
   return (
