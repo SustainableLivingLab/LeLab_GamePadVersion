@@ -5,8 +5,14 @@ lerobot GPU image, with its port exposed through the HF jobs proxy (reachable
 only with the account's token). LeLab keeps at most one such server; the arm
 loop (remote_rollout.py) talks to it once it reports ready.
 
-States reported to the app: off, starting (machine starting), loading (model
-loading), ready, error.
+Picking another checkpoint while the server is on swaps the model on the same
+machine (POST /load) instead of starting a new one, which skips the queue and
+machine start.
+
+States reported to the app: off, starting (waiting for / starting the
+machine), loading (model downloading or loading), ready, error; plus "steps"
+for the checklist (wait for a GPU, start the machine, download the model,
+load it), with "last time" durations.
 """
 
 from __future__ import annotations
@@ -56,22 +62,62 @@ def _model_location(policy_ref: str) -> tuple[str, str]:
     raise ValueError("Only trainings saved on Hugging Face can run on the cloud GPU.")
 
 
-def _health(url: str, token: str) -> dict[str, Any] | None:
-    req = urllib.request.Request(url + "/health")
+def _call(url: str, token: str, path: str, body: dict | None = None, timeout: float = 8) -> dict[str, Any] | None:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url + path, data=data, method="POST" if body is not None else "GET")
     req.add_header("Authorization", f"Bearer {token}")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         return None
 
 
+# ---- "last time" durations for the checklist ------------------------------
+
+
+def _timings_file() -> Path:
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    return Path(HF_LEROBOT_HOME) / "lelab_cloud_gpu_timings.json"
+
+
+def _load_timings() -> dict[str, Any]:
+    try:
+        return json.loads(_timings_file().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_timing(key: str, step: str, seconds: float) -> None:
+    try:
+        timings = _load_timings()
+        timings.setdefault(key, {})[step] = round(seconds, 1)
+        _timings_file().write_text(json.dumps(timings, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ---- start / swap / stop ---------------------------------------------------
+
+
 def start(policy_ref: str, flavor: str = DEFAULT_FLAVOR) -> dict[str, Any]:
     repo, subfolder = _model_location(policy_ref)
     with _lock:
-        if _server.get("job_id") and _server.get("policy_ref") == policy_ref:
+        running = dict(_server)
+    if running.get("job_id") and running.get("flavor") == flavor:
+        if running.get("policy_ref") == policy_ref:
             return status()
-    if _server.get("job_id"):
+        # Same machine, another model: swap it there (no queue, no machine
+        # start). If the server isn't reachable yet, status() sends the swap
+        # once it is.
+        with _lock:
+            _server.update(policy_ref=policy_ref, swap_requested=time.time(), swap_sent=False)
+        logger.info("Cloud GPU: switching model to %s", policy_ref)
+        return status()
+    if running.get("job_id"):
         stop()
 
     api, token = _hf()
@@ -95,65 +141,12 @@ def start(policy_ref: str, flavor: str = DEFAULT_FLAVOR) -> dict[str, Any]:
             flavor=flavor,
             started_at=time.time(),
             url=None,
+            running_at=None,
+            reachable_at=None,
+            swap_sent=True,  # the first model is loaded from the job's settings
         )
     logger.info("Cloud GPU requested: job %s (%s) for %s", job.id, flavor, policy_ref)
     return status()
-
-
-def status() -> dict[str, Any]:
-    with _lock:
-        server = dict(_server)
-    if not server.get("job_id"):
-        return {"state": "off"}
-
-    base = {
-        "policy_ref": server["policy_ref"],
-        "flavor": server["flavor"],
-        "price_per_hour": PRICE_PER_HOUR.get(server["flavor"]),
-        "elapsed_s": round(time.time() - server["started_at"]),
-        "job_url": server.get("job_url"),
-    }
-    api, token = _hf()
-    try:
-        info = api.inspect_job(job_id=server["job_id"])
-    except Exception as exc:
-        return {**base, "state": "starting", "message": f"Could not reach Hugging Face: {exc}"}
-
-    stage = info.status.stage
-    if stage in ("ERROR", "COMPLETED", "CANCELED", "DELETED"):
-        with _lock:
-            if _server.get("job_id") == server["job_id"]:
-                _server.clear()
-        if stage == "ERROR":
-            return {**base, "state": "error", "message": info.status.message or "The cloud GPU stopped with an error."}
-        # COMPLETED: the server turned itself off after being idle.
-        return {"state": "off", "message": "The cloud GPU turned itself off."}
-
-    url = (getattr(info.status, "expose_urls", None) or [None])[0]
-    if stage != "RUNNING" or not url:
-        return {**base, "state": "starting"}
-    with _lock:
-        if _server.get("job_id") == server["job_id"]:
-            _server["url"] = url
-    health = _health(url, token)
-    if health is None:
-        return {**base, "state": "starting"}
-    if health.get("error"):
-        return {**base, "state": "error", "message": health["error"]}
-    if not health.get("ready"):
-        return {**base, "state": "loading"}
-    return {**base, "state": "ready"}
-
-
-def ready_url(policy_ref: str) -> str:
-    """The server address to drive the arm with, or ValueError with a reason."""
-    current = status()
-    if current.get("state") != "ready":
-        raise ValueError("The cloud GPU isn't ready yet. Start it first and wait until it says ready.")
-    if current.get("policy_ref") != policy_ref:
-        raise ValueError("The cloud GPU has a different training loaded. Start it again for this one.")
-    with _lock:
-        return _server["url"]
 
 
 def stop() -> dict[str, Any]:
@@ -168,3 +161,158 @@ def stop() -> dict[str, Any]:
         except Exception as exc:
             logger.warning("Could not cancel cloud GPU job %s: %s", job_id, exc)
     return {"state": "off"}
+
+
+# ---- status ----------------------------------------------------------------
+
+
+def _steps(server: dict, stage: str, health: dict | None, now: float) -> list[dict[str, Any]]:
+    """Checklist: wait for a GPU, start the machine, download, load, ready."""
+    timings = _load_timings()
+    machine_last = timings.get(f"machine:{server['flavor']}", {})
+    model_last = timings.get(server["policy_ref"], {})
+    swapped = server.get("swap_requested") is not None
+
+    def step(step_id, label, state, seconds=None, last=None, detail=None):
+        item = {"id": step_id, "label": label, "state": state}
+        if seconds is not None:
+            item["seconds"] = round(seconds, 1)
+        if last is not None:
+            item["last_seconds"] = last
+        if detail:
+            item["detail"] = detail
+        return item
+
+    out = []
+    if not swapped:
+        running_at, reachable_at = server.get("running_at"), server.get("reachable_at")
+        if stage != "RUNNING":
+            out.append(step("queue", "Wait for a free GPU on Hugging Face", "active",
+                            now - server["started_at"], machine_last.get("queue")))
+        else:
+            out.append(step("queue", "Wait for a free GPU on Hugging Face", "done",
+                            (running_at or now) - server["started_at"]))
+        if stage != "RUNNING":
+            out.append(step("machine", "Start the cloud machine", "pending"))
+        elif reachable_at is None:
+            out.append(step("machine", "Start the cloud machine", "active",
+                            now - (running_at or now), machine_last.get("machine")))
+        else:
+            out.append(step("machine", "Start the cloud machine", "done", reachable_at - (running_at or reachable_at)))
+
+    phase = (health or {}).get("phase")
+    times = (health or {}).get("times") or {}
+    model_matches = (health or {}).get("model") == _model_key(server["policy_ref"])
+    elapsed = (health or {}).get("phase_elapsed")
+    if health is None or not model_matches or phase == "starting":
+        download_state, load_state = "pending", "pending"
+    elif phase == "downloading":
+        download_state, load_state = "active", "pending"
+    elif phase == "loading":
+        download_state, load_state = "done", "active"
+    elif phase == "ready":
+        download_state, load_state = "done", "done"
+    else:
+        download_state, load_state = "done", "pending"
+
+    detail = None
+    progress = (health or {}).get("download") or {}
+    if download_state == "active" and progress.get("total"):
+        detail = f"{progress['done'] / 1e9:.1f} of {progress['total'] / 1e9:.1f} GB"
+    out.append(step("download", "Download the model", download_state,
+                    elapsed if download_state == "active" else (times.get("download") if download_state == "done" else None),
+                    model_last.get("download"), detail))
+    out.append(step("load", "Load the AI on the GPU", load_state,
+                    elapsed if load_state == "active" else (times.get("load") if load_state == "done" else None),
+                    model_last.get("load")))
+    return out
+
+
+def _model_key(policy_ref: str) -> str:
+    repo, sub = _model_location(policy_ref)
+    return f"{repo}@{sub}"
+
+
+def status() -> dict[str, Any]:
+    with _lock:
+        server = dict(_server)
+    if not server.get("job_id"):
+        return {"state": "off"}
+
+    now = time.time()
+    base = {
+        "policy_ref": server["policy_ref"],
+        "flavor": server["flavor"],
+        "price_per_hour": PRICE_PER_HOUR.get(server["flavor"]),
+        "elapsed_s": round(now - server["started_at"]),
+        "job_url": server.get("job_url"),
+    }
+    api, token = _hf()
+    try:
+        info = api.inspect_job(job_id=server["job_id"])
+    except Exception as exc:
+        return {**base, "state": "starting", "message": f"Could not reach Hugging Face: {exc}", "steps": []}
+
+    stage = info.status.stage
+    if stage in ("ERROR", "COMPLETED", "CANCELED", "DELETED"):
+        with _lock:
+            if _server.get("job_id") == server["job_id"]:
+                _server.clear()
+        if stage == "ERROR":
+            return {**base, "state": "error", "message": info.status.message or "The cloud GPU stopped with an error."}
+        # COMPLETED: the server turned itself off after being idle.
+        return {"state": "off", "message": "The cloud GPU turned itself off."}
+
+    url = (getattr(info.status, "expose_urls", None) or [None])[0]
+    health = None
+    if stage == "RUNNING":
+        with _lock:
+            if _server.get("job_id") == server["job_id"] and _server.get("running_at") is None:
+                _server["running_at"] = now
+                _save_timing(f"machine:{server['flavor']}", "queue", now - server["started_at"])
+            server = dict(_server)
+        if url:
+            health = _call(url, token, "/health")
+            with _lock:
+                if _server.get("job_id") == server["job_id"]:
+                    _server["url"] = url
+                    if health is not None and _server.get("reachable_at") is None:
+                        _server["reachable_at"] = now
+                        _save_timing(f"machine:{server['flavor']}", "machine", now - (_server["running_at"] or now))
+                server = dict(_server)
+            # A model switch asked for before the server could be reached.
+            if health is not None and not server.get("swap_sent"):
+                repo, sub = _model_location(server["policy_ref"])
+                if _call(url, token, "/load", {"repo": repo, "subfolder": sub}) is not None:
+                    with _lock:
+                        _server["swap_sent"] = True
+                    health = _call(url, token, "/health")
+
+    steps = _steps(server, stage, health, now)
+    if health is not None and health.get("phase") == "ready" and health.get("model") == _model_key(server["policy_ref"]):
+        # Remember how long this model took, for "last time" next time.
+        times = health.get("times") or {}
+        with _lock:
+            saved = _server.get("timings_saved_for")
+            if saved != server["policy_ref"]:
+                _server["timings_saved_for"] = server["policy_ref"]
+                for step_id in ("download", "load"):
+                    if step_id in times:
+                        _save_timing(server["policy_ref"], step_id, times[step_id])
+        return {**base, "state": "ready", "steps": steps}
+    if health is not None and health.get("error") and health.get("model") == _model_key(server["policy_ref"]):
+        return {**base, "state": "error", "message": health["error"], "steps": steps}
+    if health is None:
+        return {**base, "state": "starting", "steps": steps}
+    return {**base, "state": "loading", "steps": steps}
+
+
+def ready_url(policy_ref: str) -> str:
+    """The server address to drive the arm with, or ValueError with a reason."""
+    current = status()
+    if current.get("state") != "ready":
+        raise ValueError("The cloud GPU isn't ready yet. Start it first and wait until it says ready.")
+    if current.get("policy_ref") != policy_ref:
+        raise ValueError("The cloud GPU has a different training loaded. Load this one first.")
+    with _lock:
+        return _server["url"]

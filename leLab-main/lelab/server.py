@@ -878,6 +878,98 @@ def get_job_log_file(job_id: str):
     return {"logs": logs}
 
 
+# A training's stages, read from its log (each line has its time), for the
+# checklist shown while it starts: the loss / time left only appear once
+# training itself is under way. (marker that starts the stage, id, label)
+_TRAINING_STAGE_MARKERS = (
+    ("Submitting job to HF Jobs", "machine", "Start the cloud machine"),
+    ("Creating dataset", "dataset", "Load your recordings"),
+    ("Creating policy", "model", "Load the starting model"),
+    ("Start offline training", "train", "Train"),
+    ("End of training", "save", "Save the final model"),
+)
+
+
+def _training_stage_times(job_id: str) -> list[tuple[str, float]]:
+    """(stage id, start time) for the stages seen in a job's log, in order."""
+    seen: list[tuple[str, float]] = []
+    for entry in job_registry.read_persisted_logs(job_id):
+        message = getattr(entry, "message", "") or ""
+        for marker, stage_id, _label in _TRAINING_STAGE_MARKERS:
+            if marker in message and stage_id not in [s for s, _ in seen]:
+                seen.append((stage_id, float(getattr(entry, "timestamp", 0) or 0)))
+    return seen
+
+
+def _stage_durations(record) -> dict[str, float]:
+    times = _training_stage_times(record.id)
+    end = record.ended_at or (times[-1][1] if times else None)
+    out = {}
+    for i, (stage_id, started) in enumerate(times):
+        finished = times[i + 1][1] if i + 1 < len(times) else end
+        if finished:
+            out[stage_id] = round(finished - started, 1)
+    return out
+
+
+@app.get("/jobs/{job_id}/stages")
+def get_job_stages(job_id: str):
+    """The training's stages (done / active / pending) with how long each
+    took, plus "last time" from the latest finished training of the same
+    model in the same place (cloud or this computer)."""
+    import time as _time
+
+    try:
+        record = job_registry.get(job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
+    cloud = record.runner == "hf_cloud"
+    stages = [(i, label) for _m, i, label in _TRAINING_STAGE_MARKERS if cloud or i != "machine"]
+    pretrained = bool(record.config.policy_path or getattr(record.config, "policy_pretrained_path", None))
+    if not pretrained:
+        stages = [(i, "Set up the model" if i == "model" else label) for i, label in stages]
+
+    times = dict(_training_stage_times(job_id))
+    order = [i for i, _ in stages]
+    finished = record.state != "running"
+    # The last finished training of the same kind, for "last time about".
+    last = {}
+    with contextlib.suppress(Exception):
+        for other in job_registry.list(limit=100):
+            if (
+                other.id != record.id
+                and other.state == "done"
+                and other.runner == record.runner
+                and other.config.policy_type == record.config.policy_type
+                and bool(other.config.policy_path) == bool(record.config.policy_path)
+            ):
+                last = _stage_durations(other)
+                break
+
+    now = _time.time()
+    started_at = record.started_at
+    out = []
+    for index, (stage_id, label) in enumerate(stages):
+        start = times.get(stage_id)
+        if cloud and stage_id == "machine" and start is None:
+            start = started_at
+        later = [times[o] for o in order[index + 1 :] if o in times]
+        end = later[0] if later else (record.ended_at if finished and start else None)
+        if start is None:
+            state = "done" if finished and record.state == "done" else "pending"
+        elif end is None:
+            state = "active"
+        else:
+            state = "done"
+        item = {"id": stage_id, "label": label, "state": state}
+        if start is not None:
+            item["seconds"] = round((end or now) - start, 1)
+        if stage_id in last:
+            item["last_seconds"] = last[stage_id]
+        out.append(item)
+    return {"stages": out}
+
+
 @app.get("/jobs/{job_id}/metrics-history")
 def get_job_metrics_history(job_id: str):
     """Return the per-step loss/lr/grad-norm series reconstructed from the
