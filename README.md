@@ -325,6 +325,21 @@ machine, you may need your IT admin to allow it instead.
   mode), or fall back to a **USB cable or a wireless USB dongle** for that controller, which
   reliably registers as a proper game controller on Windows.
 
+### Logging into Hugging Face (needed for recording, upload, and training)
+
+Recording a dataset, uploading to the Hub, and training all need a Hugging Face account logged
+in on this machine. If you haven't done this yet, you'll see an amber **"Hugging Face not
+configured"** chip near the top of the landing page.
+
+1. Click the chip to open the login dialog.
+2. Get a token from <https://huggingface.co/settings/tokens> (create one if you don't have one;
+   it needs **write** access, since recording pushes datasets to the Hub).
+3. Paste the token into the box in the dialog and click **Log in with token**. That's it: no
+   terminal needed, the app validates and saves the token immediately.
+
+If pasting doesn't work for some reason, the dialog also shows a `hf auth login` command you can
+run in a terminal instead, with a "recheck" button to confirm it took.
+
 ### "Could not connect to the follower arm on COM_"
 
 - Check the arm is powered on and the USB cable is fully seated.
