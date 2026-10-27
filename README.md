@@ -366,6 +366,12 @@ and your IT admin controls both settings; ask them to either allow this install 
 If you're not sure Git itself is even installed, get it here:
 <https://git-scm.com/downloads/win>. Accept the defaults during install.
 
+If the fixes above don't help and the window keeps closing specifically during the `uv` install
+step (the `irm https://astral.sh/uv/install.ps1 | iex` part), see `uv`'s own install docs and
+alternative install methods here: <https://docs.astral.sh/uv/getting-started/installation/>.
+A manual download/installer of the standalone `uv` binary is listed there as an alternative to
+the `irm | iex` one-liner, which can sidestep this issue entirely on a locked-down machine.
+
 ### Gamepad not detected
 
 - Make sure the controller is connected **at the operating-system level first**: Python only
