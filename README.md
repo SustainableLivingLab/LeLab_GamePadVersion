@@ -385,6 +385,26 @@ alternative install methods here: <https://docs.astral.sh/uv/getting-started/ins
 A manual download/installer of the standalone `uv` binary is listed there as an alternative to
 the `irm | iex` one-liner, which can sidestep this issue entirely on a locked-down machine.
 
+### Only one camera detected when multiple are connected
+
+If `/available-cameras` (and the "Add Camera" dropdown, which reads from it) shows fewer cameras
+than you have plugged in, even though every one of them works fine on its own and shows up in
+the Windows Camera app individually, this is a USB enumeration limit, not a bug in the app: some
+laptops' USB controllers, hubs, or camera drivers can't register more than one video-capture
+device at the same time.
+
+To confirm: unplug every camera except one, refresh `/available-cameras`, and check it appears.
+If it does, repeat with just the other camera. Each one working alone but not together confirms
+this is the cause.
+
+Fixes, try in this order:
+
+- **Plug the cameras into different USB ports**, ideally on different physical USB controllers
+  (e.g. one USB-A port and one USB-C port, or ports on opposite sides of the laptop).
+- **Use a powered USB hub** if your laptop simply doesn't have enough independent USB controllers.
+- **Plug in last whichever camera you want detected**: on some systems the most recently
+  connected device wins when there's a conflict.
+
 ### Gamepad not detected
 
 - Make sure the controller is connected **at the operating-system level first**: Python only
