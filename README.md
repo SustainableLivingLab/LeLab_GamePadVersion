@@ -363,6 +363,9 @@ the same instant-close symptom independently of Defender.
 If both of these are already off, or the toggle is greyed out, this is a company-managed machine
 and your IT admin controls both settings; ask them to either allow this install or run it for you.
 
+If you're not sure Git itself is even installed, get it here:
+<https://git-scm.com/downloads/win>. Accept the defaults during install.
+
 ### Gamepad not detected
 
 - Make sure the controller is connected **at the operating-system level first**: Python only
