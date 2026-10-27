@@ -238,6 +238,106 @@ def _recompute_stats(root: Path, info: dict[str, Any], rows: list[dict[str, Any]
     write_stats(aggregate_stats(per_episode), root)
 
 
+def _real_video_frame_count(path: Path) -> int:
+    """Actual decodable frame count of an mp4 -- container metadata (``stream.frames``)
+    is frequently 0 or wrong for files this app encodes, so decode for real."""
+    import av
+
+    with av.open(str(path)) as container:
+        return sum(1 for _ in container.decode(container.streams.video[0]))
+
+
+def _clamp_row_video_windows(
+    row: dict[str, Any],
+    root: Path,
+    info: dict[str, Any],
+    video_keys: list[str],
+    frame_counts: dict[tuple[str, int], int],
+) -> int:
+    """Clamp one episode row's video windows in place. Returns how many were clamped."""
+    fps = info["fps"]
+    clamped = 0
+    for video_key in video_keys:
+        to_key = f"videos/{video_key}/to_timestamp"
+        from_key = f"videos/{video_key}/from_timestamp"
+        file_index = row.get(f"videos/{video_key}/file_index")
+        if file_index is None or to_key not in row or row[to_key] is None:
+            continue
+
+        cache_key = (video_key, int(file_index))
+        if cache_key not in frame_counts:
+            path = next((root / "videos" / video_key).rglob(f"*file-{file_index:03d}.mp4"), None)
+            frame_counts[cache_key] = _real_video_frame_count(path) if path else 0
+        num_frames = frame_counts[cache_key]
+
+        last_frame_needed = round(row[to_key] * fps) - 1
+        if last_frame_needed >= num_frames:
+            safe_to_timestamp = num_frames / fps
+            if safe_to_timestamp <= (row.get(from_key) or 0.0):
+                # Nothing usable left in this file for this episode/key;
+                # leave it be rather than produce a negative-length window.
+                continue
+            logger.warning(
+                "%s episode %s video %s: to_timestamp %.4fs needs frame %d but file-%03d.mp4 "
+                "only has %d real frames -- clamping to %.4fs",
+                root.name,
+                row.get("episode_index"),
+                video_key,
+                row[to_key],
+                last_frame_needed,
+                file_index,
+                num_frames,
+                safe_to_timestamp,
+            )
+            row[to_key] = safe_to_timestamp
+            clamped += 1
+    return clamped
+
+
+def fix_video_window_overruns_in_place(root: Path, info: dict[str, Any]) -> int:
+    """Clamp video windows that ask for frames past what the file has, rewriting
+    each existing meta/episodes/*.parquet file in place (every other column,
+    including stats/*, passes through untouched).
+
+    Continue Recording restarts camera capture per key independently, so two
+    cameras recording the "same" episode can end up a frame or two apart --
+    one video_key's file ends up shorter than the episode's to_timestamp
+    implies. The dataloader then indexes past the end of that video and
+    crashes (IndexError from torchcodec) partway through training, often long
+    after the dataset was already pushed to the Hub. Clamping every video
+    key's to_timestamp to the tightest real duration available keeps all
+    cameras requesting frames that actually exist, at the cost of at most a
+    couple of frames of trailing video per affected episode.
+
+    Returns how many (episode, video_key) windows were clamped across the
+    whole dataset.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    video_keys = [key for key, feature in info["features"].items() if feature["dtype"] == "video"]
+    if not video_keys:
+        return 0
+
+    frame_counts: dict[tuple[str, int], int] = {}
+    total_clamped = 0
+    for path in sorted((root / "meta" / "episodes").rglob("*.parquet"), key=_chunk_file):
+        table = pq.read_table(path)
+        rows = table.to_pylist()
+        file_clamped = sum(
+            _clamp_row_video_windows(row, root, info, video_keys, frame_counts) for row in rows
+        )
+        if file_clamped:
+            pq.write_table(
+                pa.Table.from_pylist(rows, schema=table.schema),
+                path,
+                compression="snappy",
+                use_dictionary=True,
+            )
+        total_clamped += file_clamped
+    return total_clamped
+
+
 def _write_episodes(root: Path, rows: list[dict[str, Any]]) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -270,13 +370,27 @@ def repair_local_dataset(repo_id: str) -> str | None:
     if not (root / "meta" / "info.json").exists():
         return None
 
+    info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
+
     try:
-        load_episodes(root)
-        return None
+        episodes_df = load_episodes(root)
     except Exception as e:
         logger.info("%s has no usable episode index (%s) — rebuilding it from disk", repo_id, e)
+        episodes_df = None
 
-    info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
+    if episodes_df is not None:
+        # The index loaded fine, but it can still record a video window that
+        # asks for more frames than a camera's file actually has (see
+        # fix_video_window_overruns_in_place). That's a silent corruption
+        # load_episodes can't detect on its own, so always check it even on
+        # the happy path.
+        clamped = fix_video_window_overruns_in_place(root, info)
+        if clamped == 0:
+            return None
+        message = f"Clamped {clamped} video window(s) in {repo_id} that pointed past the end of a camera's recording"
+        logger.info(message)
+        return message
+
     fps = info["fps"]
     recorded_episodes = info.get("total_episodes", 0)
 
@@ -302,6 +416,14 @@ def repair_local_dataset(repo_id: str) -> str | None:
         # readable shards; drop them so data, index and stats agree.
         _trim_data(root, rows[-1]["episode_index"])
         _recompute_stats(root, info, rows)
+
+    # _assign_videos trusts each episode's row count (from data/) to compute
+    # to_timestamp; a camera that recorded one fewer real frame than its row
+    # count implies needs the same clamp as the happy path above.
+    video_keys = [key for key, feature in info["features"].items() if feature["dtype"] == "video"]
+    frame_counts: dict[tuple[str, int], int] = {}
+    for row in rows:
+        _clamp_row_video_windows(row, root, info, video_keys, frame_counts)
 
     _write_episodes(root, rows)
 
