@@ -346,6 +346,39 @@ either. To fix it: open **Settings → Privacy & security → Windows Security �
 control → Smart App Control**, turn it off, then run `lelab-gamepad` again. On a company-managed
 machine, you may need your IT admin to allow it instead.
 
+### PowerShell window closes instantly when you run the Quick Start command
+
+If the window vanishes the moment you press Enter, with no error text at all, it's almost always
+one of two things blocking script execution for your Windows user account. Try both fixes below,
+in order, then open a fresh PowerShell window and run the Quick Start command again.
+
+**1. Allow PowerShell scripts for your user account** (no admin rights needed):
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+Type `Y` and press Enter if it asks to confirm. This only changes the policy for your own
+Windows user account, not the whole machine.
+
+**2. Turn off Windows Defender's real-time protection** (temporarily, just for this install):
+
+1. Open **Windows Security** (search for it in the Start menu).
+2. Go to **Virus & threat protection**.
+3. Under "Virus & threat protection settings," click **Manage settings**.
+4. Turn **Real-time protection** off (approve the prompt if asked).
+5. Run the Quick Start command again in a fresh PowerShell window.
+6. Turn Real-time protection back **on** once the install finishes. Don't leave it off.
+
+Also double-check **Smart App Control** (the section right above this one) is off; it can cause
+the same instant-close symptom independently of Defender.
+
+If both of these are already off, or the toggle is greyed out, this is a company-managed machine
+and your IT admin controls both settings; ask them to either allow this install or run it for you.
+
+If you're not sure Git itself is even installed, get it here:
+<https://git-scm.com/downloads/win>. Accept the defaults during install.
+
 ### Gamepad not detected
 
 - Make sure the controller is connected **at the operating-system level first**: Python only
