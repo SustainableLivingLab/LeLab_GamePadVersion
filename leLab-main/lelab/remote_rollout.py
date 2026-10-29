@@ -149,6 +149,9 @@ def main() -> None:
     robot = make_robot_from_config(cfg.robot)
     logger.info("Connecting robot and cameras...")
     robot.connect()
+    from lelab.utils.devices import make_cameras_resilient
+
+    make_cameras_resilient(getattr(robot, "cameras", {}) or {}, logger)
     camera_keys = list(cfg.robot.cameras)
     motor_names = [f"{m}.pos" for m in robot.bus.motors]
     initial = {k: v for k, v in robot.get_observation().items() if k in motor_names}

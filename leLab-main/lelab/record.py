@@ -40,6 +40,7 @@ from .utils.devices import (
     check_plugged_in_device,
     connect_bus_with_fault_recovery,
     make_bus_io_resilient,
+    make_cameras_resilient,
     safe_disconnect_device,
     sync_goal_to_present,
 )
@@ -956,6 +957,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
             connect_bus_with_fault_recovery(robot.bus, logger)
             # One glitched read would otherwise end the whole recording.
             make_bus_io_resilient(robot.bus, logger)
+            make_cameras_resilient(getattr(robot, "cameras", {}) or {}, logger)
             logger.info("✅ ROBOT CONNECTION: Robot bus connected successfully")
         except Exception as e:
             logger.error(f"❌ ROBOT CONNECTION: Failed to connect robot: {e}")

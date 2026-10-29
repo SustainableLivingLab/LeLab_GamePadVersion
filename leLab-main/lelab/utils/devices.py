@@ -8,6 +8,7 @@ close the underlying port/cameras as a last resort.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from contextlib import suppress
@@ -207,6 +208,69 @@ def make_bus_io_resilient(bus: Any, logger: logging.Logger) -> None:
 
     bus.sync_read = resilient("sync_read")
     bus.sync_write = resilient("sync_write")
+
+
+# How long a camera may go without a new picture before a recording gives up
+# (lerobot's own limit is 0.5 s, after which it ends the whole session).
+CAMERA_STALL_WINDOW_S = 3.0
+CAMERA_RETRY_PAUSE_S = 0.02
+
+
+def make_cameras_resilient(cameras: dict[str, Any], logger: logging.Logger) -> None:
+    """Let each camera's read_latest wait out a short stall instead of failing.
+
+    lerobot reads only a camera's newest picture and raises as soon as it is
+    older than 0.5 s, which ended a 23-minute recording session on a 506 ms
+    hiccup (two cameras on one USB hub, a brief Windows pause, auto exposure
+    adjusting). This waits up to CAMERA_STALL_WINDOW_S for a fresh picture,
+    and reopens a camera once if its background reader stopped. A camera that
+    stays silent past the window still ends the session, with a clear reason.
+    """
+
+    for name, camera in cameras.items():
+        original = camera.read_latest
+
+        def read_latest(max_age_ms: int = 500, *, _camera=camera, _name=name, _original=original):
+            try:
+                return _original(max_age_ms)
+            except (TimeoutError, RuntimeError) as first_error:
+                started = time.monotonic()
+                deadline = started + CAMERA_STALL_WINDOW_S
+                reopened = False
+                last_error: Exception = first_error
+                while time.monotonic() < deadline:
+                    reader = getattr(_camera, "thread", None)
+                    if (reader is None or not reader.is_alive()) and not reopened:
+                        # The background reader died (e.g. the USB link
+                        # dropped for a moment): reopen the camera once.
+                        reopened = True
+                        try:
+                            with contextlib.suppress(Exception):
+                                _camera.disconnect()
+                            _camera.connect()
+                            logger.warning("Camera %s: reopened after its picture feed stopped", _name)
+                        except Exception as exc:  # noqa: BLE001 - reported below if it never recovers
+                            last_error = exc
+                    time.sleep(CAMERA_RETRY_PAUSE_S)
+                    try:
+                        frame = _original(max_age_ms)
+                    except (TimeoutError, RuntimeError) as exc:
+                        last_error = exc
+                        continue
+                    logger.warning(
+                        "Camera %s: no new picture for a moment (%s); continued after %.0f ms",
+                        _name,
+                        first_error,
+                        (time.monotonic() - started) * 1000,
+                    )
+                    return frame
+                raise TimeoutError(
+                    f"Camera {_name} stopped sending pictures for {CAMERA_STALL_WINDOW_S:.0f} seconds "
+                    f"({last_error}). Check its USB cable, or plug it straight into the computer "
+                    "instead of a hub."
+                ) from last_error
+
+        camera.read_latest = read_latest
 
 
 def sync_goal_to_present(bus: Any, logger: logging.Logger) -> None:
