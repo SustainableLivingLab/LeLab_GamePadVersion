@@ -37,6 +37,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .utils import live_task
 from .utils.config import setup_follower_calibration_file
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ class InferenceRequest(BaseModel):
     # Run the policy on the cloud GPU (remote_server.py) instead of this
     # computer; the server must already be started and ready.
     remote: bool = False
+    # Let the top camera pick the task from the cube between the baskets
+    # (cube_colors.CubeWatcher's settings).
+    cube_watch: dict[str, Any] | None = None
 
 
 inference_active: bool = False
@@ -665,7 +669,8 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             cmd = [
                 sys.executable,
                 "-m",
-                "lerobot.scripts.lerobot_rollout",
+                # lerobot's rollout script, with a task that can change mid-run.
+                "lelab.local_rollout",
                 "--strategy.type=base",
                 f"--policy.path={policy_path}",
                 f"--policy.device={_detect_device()}",
@@ -692,6 +697,9 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{int(time.time())}.log"
         log_handle = log_path.open("w", buffering=1, encoding="utf-8")
+        # The task the run reads before each plan; /inference-task rewrites it.
+        task_path = log_path.with_suffix(".task")
+        live_task.write(task_path, request.task)
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -702,6 +710,16 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         # avoids it.
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
+        env[live_task.ENV_VAR] = str(task_path)
+        seen_path = None
+        if request.cube_watch:
+            from .cube_colors import CUBE_SEEN_ENV, CUBE_WATCH_ENV
+
+            watch_path = log_path.with_suffix(".cubes.json")
+            watch_path.write_text(json.dumps(request.cube_watch), encoding="utf-8")
+            seen_path = log_path.with_suffix(".seen.json")
+            env[CUBE_WATCH_ENV] = str(watch_path)
+            env[CUBE_SEEN_ENV] = str(seen_path)
         # Feed a single newline into stdin so SOFollower.calibrate()'s
         # `input("Press ENTER to use the calibration file ...")` returns "" and
         # writes the existing calibration to the motors instead of hanging
@@ -764,9 +782,59 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             "policy_ref": request.policy_ref,
             "duration_s": request.duration_s,
             "log_path": str(log_path),
+            "task_path": str(task_path),
+            "task": request.task,
+            "seen_path": str(seen_path) if seen_path else None,
         }
     logger.info("Inference started: pid=%s policy=%s", proc.pid, policy_path)
     return {"success": True, "message": "Inference started", "log_path": str(log_path)}
+
+
+def _live_task_status(meta: dict[str, Any]) -> dict[str, Any]:
+    """The task the run is on now (the camera may have changed it) and the
+    cube the camera sees, if it is watching (cube_view: what the app draws
+    over the camera picture, see cube_colors.CubeWatcher.view)."""
+    out: dict[str, Any] = {"task": meta.get("task"), "cube_watch": bool(meta.get("seen_path"))}
+    try:
+        if meta.get("task_path"):
+            out["task"] = Path(meta["task_path"]).read_text(encoding="utf-8").strip() or out["task"]
+    except OSError:
+        pass
+    try:
+        if meta.get("seen_path"):
+            view = json.loads(Path(meta["seen_path"]).read_text(encoding="utf-8"))
+            out["cube_seen"] = view.get("seen")
+            out["cube_view"] = view
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def inference_camera_picture() -> bytes | None:
+    """The top camera picture the running AI's cube watcher last looked at."""
+    with _state_lock:
+        seen_path = _inference_meta.get("seen_path") if inference_active else None
+    if not seen_path:
+        return None
+    try:
+        return Path(seen_path).with_suffix(".jpg").read_bytes()
+    except OSError:
+        return None
+
+
+def handle_set_inference_task(task: str) -> dict[str, Any]:
+    """Change the running AI's task; it switches at its next plan."""
+    task = task.strip()
+    if not task:
+        return {"success": False, "status_code": 400, "message": "Write the task first."}
+    with _state_lock:
+        task_path = _inference_meta.get("task_path")
+        if not inference_active or not task_path:
+            return {"success": False, "status_code": 409, "message": "The AI isn't running."}
+        live_task.write(Path(task_path), task)
+        _inference_meta["task"] = task
+    logger.info("Inference task changed to: %s", task)
+    return {"success": True, "task": task}
 
 
 def handle_stop_inference() -> dict[str, Any]:
@@ -901,4 +969,5 @@ def handle_inference_status() -> dict[str, Any]:
             "duration_s": _inference_meta.get("duration_s"),
             "policy_ref": _inference_meta.get("policy_ref"),
             "log_path": _inference_meta.get("log_path"),
+            **_live_task_status(_inference_meta),
         }

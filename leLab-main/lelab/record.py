@@ -39,6 +39,7 @@ from .utils.config import setup_calibration_files, with_lelab_tag
 from .utils.devices import (
     check_plugged_in_device,
     connect_bus_with_fault_recovery,
+    describe_device_error,
     make_bus_io_resilient,
     make_cameras_resilient,
     safe_disconnect_device,
@@ -98,6 +99,10 @@ class RecordingRequest(BaseModel):
     follower_config: str
     dataset_repo_id: str
     single_task: str
+    # Optional task text per episode, in order (e.g. Lesson 6 records its
+    # first half with one instruction and its second half with another).
+    # Episodes past the end of the list, or an empty list, use single_task.
+    episode_tasks: list[str] = []
     num_episodes: int = 30
     # These two only take effect when timed_sessions=True; see
     # create_record_config()'s UNLIMITED_TIME_S handling otherwise.
@@ -118,6 +123,16 @@ class RecordingRequest(BaseModel):
     streaming_encoding: bool = True
     cameras: dict = {}
     test_mode: bool = False  # Skip robot connection for testing
+
+
+def episode_task(default: str) -> str:
+    """Task text for the episode being recorded next: the request's
+    episode_tasks entry for it (counted in kept episodes, as the app does),
+    else the session's single task."""
+    tasks = recording_config.episode_tasks if recording_config else []
+    with episode_lock:
+        index = saved_episodes
+    return tasks[index] if index < len(tasks) and tasks[index].strip() else default
 
 
 class UploadRequest(BaseModel):
@@ -336,6 +351,8 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
 
         logger.info(f"Starting recording for dataset: {request.dataset_repo_id}")
         logger.info(f"Task: {request.single_task}")
+        if request.episode_tasks:
+            logger.info(f"Task per episode: {request.episode_tasks}")
 
         recording_config = request
         recording_events = {
@@ -409,7 +426,7 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
                 # count: the frontend still offers them for upload.
                 last_recording_info = {
                     "success": False,
-                    "error": str(e),
+                    "error": describe_device_error(e),
                     "dataset_repo_id": request.dataset_repo_id,
                     "saved_episodes": saved_episodes,
                 }
@@ -1046,7 +1063,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
                 teleop=teleop,
                 dataset=dataset,
                 control_time_s=cfg.dataset.episode_time_s,
-                single_task=cfg.dataset.single_task,
+                single_task=episode_task(cfg.dataset.single_task),
                 display_data=cfg.display_data,
             )
 

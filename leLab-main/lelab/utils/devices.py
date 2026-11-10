@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import time
 from contextlib import suppress
 from typing import Any
@@ -32,6 +33,50 @@ class MotorFaultError(RuntimeError):
     always a servo still in overload protection, not a cabling problem."""
 
 
+# Feetech status-packet error bit for overload protection (scservo_sdk's
+# ERRBIT_OVERLOAD). Protection stays latched until the motors lose power.
+OVERLOAD_ERROR_BIT = 32
+# Motor IDs seen in overload protection, with when, so the error shown to the
+# student can name every one of them, not just the motor lerobot's exception
+# happened to stop at. Forgotten after a minute (and once reported).
+OVERLOAD_MEMORY_S = 60
+_recent_overloads: dict[int, float] = {}
+
+
+def _note_overload(motor_id: int) -> None:
+    _recent_overloads[motor_id] = time.monotonic()
+
+
+def overload_message(exc: BaseException | None = None) -> str | None:
+    """The student-facing message for motors stuck in overload protection,
+    naming them (M1-M6 are the motor IDs), or None if nothing points to an
+    overload. Reads the exception text and the motors noted by
+    release_torque_best_effort() in the last minute."""
+    text = str(exc) if exc is not None else ""
+    now = time.monotonic()
+    ids = {motor_id for motor_id, seen in _recent_overloads.items() if now - seen < OVERLOAD_MEMORY_S}
+    if "Overload error" in text:
+        ids.update(int(found) for found in re.findall(r"id_=(\d+)", text))
+    elif not ids:
+        return None
+    _recent_overloads.clear()
+
+    names = [f"M{motor_id}" for motor_id in sorted(ids)]
+    if not names:
+        subject = "A motor is"
+    elif len(names) == 1:
+        subject = f"{names[0]} is"
+    else:
+        subject = f"{', '.join(names[:-1])} and {names[-1]} are"
+    return f"{subject} overloaded. Unplug the arm's power, wait 15 seconds, and plug it back in."
+
+
+def describe_device_error(exc: BaseException) -> str:
+    """str(exc), unless it comes from motors in overload protection: then
+    the plain message saying which ones and how to clear it."""
+    return overload_message(exc) or str(exc)
+
+
 def release_torque_best_effort(bus: Any, logger: logging.Logger) -> list[str]:
     """Turn torque off on every motor, one at a time, ignoring per-motor
     errors -- lerobot's own disable_torque() raises on the first faulted motor
@@ -45,6 +90,8 @@ def release_torque_best_effort(bus: Any, logger: logging.Logger) -> list[str]:
             comm, error = bus._write(addr, length, motor.id, 0, num_retry=1, raise_on_error=False)
             if not bus._is_comm_success(comm) or bus._is_error(error):
                 failed.append(name)
+            if error & OVERLOAD_ERROR_BIT:
+                _note_overload(motor.id)
         except Exception:
             failed.append(name)
     if failed:
@@ -147,10 +194,11 @@ def connect_bus_with_fault_recovery(bus: Any, logger: logging.Logger) -> None:
                 port_handler.is_using = False
                 port_handler.closePort()
             if attempt == FAULT_RETRY_ATTEMPTS:
+                # Almost always overload protection (the arm was pushed,
+                # stalled, or jerked hard), even when no reply said so.
                 raise MotorFaultError(
-                    "A motor on the arm isn't responding normally -- it most likely tripped its overload "
-                    "protection (the arm was pushed, stalled, or jerked hard). Unplug the arm's power, wait about "
-                    "15 seconds before plugging it back in (a quick replug isn't enough), then try again."
+                    overload_message(exc)
+                    or "A motor is overloaded. Unplug the arm's power, wait 15 seconds, and plug it back in."
                 ) from exc
             logger.warning(
                 "Motor handshake failed (attempt %d/%d), retrying in %.1fs: %s",

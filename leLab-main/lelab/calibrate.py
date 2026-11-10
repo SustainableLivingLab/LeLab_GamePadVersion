@@ -47,7 +47,7 @@ from lerobot.teleoperators import (
 )
 from lerobot.utils.utils import init_logging
 
-from .utils.devices import safe_disconnect_device
+from .utils.devices import overload_message, safe_disconnect_device
 
 logger = logging.getLogger(__name__)
 
@@ -443,8 +443,10 @@ class CalibrationManager:
         except Exception as e:
             logger.error(f"Calibration error: {e}")
             logger.error(traceback.format_exc())
-            # Ensure cleanup happens even on error
-            self._cleanup_and_finish(f"Calibration failed: {e}", status="error")
+            # Ensure cleanup happens even on error. Cleanup first: it is what
+            # notices motors stuck in overload, for the message.
+            self._cleanup_device()
+            self._cleanup_and_finish(overload_message(e) or f"Calibration failed: {e}", status="error")
         finally:
             # Ensure we always clean up and reset the active flag
             logger.info("Calibration worker thread finishing")

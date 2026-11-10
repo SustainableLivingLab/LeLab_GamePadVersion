@@ -31,6 +31,7 @@ from .utils.devices import (
     WrongDeviceError,
     check_plugged_in_device,
     connect_bus_with_fault_recovery,
+    describe_device_error,
     safe_disconnect_device,
     sync_goal_to_present,
 )
@@ -431,7 +432,7 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         logger.error(f"Failed to start teleoperation: {e}")
         # str(e) is already a user-facing message for the connection failures
         # raised above; the toast title supplies the "error starting" context.
-        return {"success": False, "message": str(e)}
+        return {"success": False, "message": describe_device_error(e)}
 
 
 def handle_stop_teleoperation() -> dict[str, Any]:

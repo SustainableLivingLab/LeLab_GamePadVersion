@@ -124,6 +124,20 @@ class _Reader:
             self.released.set()
 
 
+def latest_frame(index: int):
+    """The newest preview picture of camera `index` (BGR), or None when that
+    camera isn't previewing."""
+    import cv2
+    import numpy as np
+
+    with _lock:
+        reader = _readers.get(index)
+    data = reader.frame if reader is not None else None
+    if data is None:
+        return None
+    return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
 def stop_all_previews(timeout_s: float = 3.0, settle_s: float = 1.0) -> None:
     """Stop every preview and wait until their cameras are released, plus
     `settle_s`: on Windows a camera closed a moment ago often can't be opened

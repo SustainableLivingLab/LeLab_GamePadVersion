@@ -38,6 +38,7 @@ from .utils.devices import (
     WrongDeviceError,
     check_plugged_in_device,
     connect_bus_with_fault_recovery,
+    describe_device_error,
     safe_disconnect_device,
     sync_goal_to_present,
 )
@@ -121,7 +122,7 @@ def handle_start_gripper_preview(request: StartGripperPreviewRequest) -> dict[st
         safe_disconnect_device(robot, logger)
         gripper_preview_active = False
         current_robot = None
-        return {"success": False, "message": str(e)}
+        return {"success": False, "message": describe_device_error(e)}
 
 
 def handle_set_gripper_preview_position(request: GripperPreviewPositionRequest) -> dict[str, Any]:

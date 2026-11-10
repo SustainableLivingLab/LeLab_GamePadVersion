@@ -35,6 +35,16 @@ import lerobot.robots.so_follower  # noqa: F401
 from lerobot.robots import make_robot_from_config
 from lerobot.robots.config import RobotConfig
 
+from lelab import cube_colors
+from lelab.utils.live_task import LiveTask
+
+# Older LeLab servers import these from here, and may still have an older
+# cube_colors loaded without them, so they're spelled out (same as there).
+CUBE_WATCH_ENV = "LELAB_CUBE_WATCH"
+CUBE_SEEN_ENV = "LELAB_CUBE_SEEN"
+# How often the watcher looks (loop steps at 30 Hz).
+WATCH_EVERY = 10
+
 # force: lerobot's imports above may already have set up logging (at a level
 # that hid these INFO lines, including the "Rollout setup complete" marker
 # LeLab watches for to show the run's progress).
@@ -71,7 +81,8 @@ class PlanClient:
         self._http = httpx.Client(
             base_url=url, headers={"Authorization": f"Bearer {token}"}, timeout=REQUEST_TIMEOUT_S
         )
-        self._task = task
+        # Re-read before each plan: LeLab can switch the task mid-run.
+        self._task = LiveTask(task)
         self._thread: threading.Thread | None = None
         self.result: tuple[list[list[float]], list[str] | None, int] | None = None
         self.error: str | None = None
@@ -82,7 +93,7 @@ class PlanClient:
         return self._thread is not None and self._thread.is_alive()
 
     def request(self, images: dict[str, np.ndarray], state: list[float], step: int) -> None:
-        payload = {"images": {k: _jpeg(v) for k, v in images.items()}, "state": state, "task": self._task}
+        payload = {"images": {k: _jpeg(v) for k, v in images.items()}, "state": state, "task": self._task.get()}
         self.result = None
         self.error = None
 
@@ -158,6 +169,7 @@ def main() -> None:
     logger.info("Robot connected: %s, cameras %s", motor_names, camera_keys)
 
     client = PlanClient(cfg.server_url, token, cfg.task)
+    watcher = cube_colors.make_watcher(cfg.task, camera_keys)
     queue: deque = deque()
     names = motor_names
     failures = 0
@@ -197,6 +209,9 @@ def main() -> None:
                 logger.warning("Plan request failed (%d/%d): %s", failures, MAX_FAILURES, error)
                 if failures >= MAX_FAILURES:
                     raise RuntimeError(f"The cloud GPU stopped answering: {error}")
+
+            if watcher is not None and step % WATCH_EVERY == 0:
+                cube_colors.watch(watcher, obs, initial)
 
             if len(queue) <= REPLAN_AT and not client.busy and client.result is None:
                 client.request({k: obs[k] for k in camera_keys}, [float(obs[n]) for n in names], step)

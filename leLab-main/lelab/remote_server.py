@@ -32,6 +32,13 @@ logger = logging.getLogger(__name__)
 # ~19 GB) for every policy LeLab trains, at the lowest price that fits.
 DEFAULT_FLAVOR = "l4x1"
 PRICE_PER_HOUR = {"l4x1": 0.80, "a10g-large": 1.50, "l40sx1": 1.80, "a100-large": 2.50}
+GPU_NAMES = {"l4x1": "L4", "a10g-large": "A10G", "l40sx1": "L40S", "a100-large": "A100"}
+# When Hugging Face has no free GPU of one kind, the request waits in its
+# queue (sometimes for half an hour or more). After QUEUE_FALLBACK_S without a
+# machine, LeLab cancels it and asks for the next kind here instead (both fit
+# every policy LeLab trains, at a higher price).
+FALLBACK_FLAVOR = {"l4x1": "a10g-large", "a10g-large": "l40sx1"}
+QUEUE_FALLBACK_S = 120
 IMAGE = "huggingface/lerobot-gpu:latest"
 PORT = 8000
 # The server turns itself off after this long without arm requests, and the
@@ -107,7 +114,9 @@ def start(policy_ref: str, flavor: str = DEFAULT_FLAVOR) -> dict[str, Any]:
     repo, subfolder = _model_location(policy_ref)
     with _lock:
         running = dict(_server)
-    if running.get("job_id") and running.get("flavor") == flavor:
+    # A request that fell back to another GPU kind still counts as this one.
+    same_machine = running.get("flavor") == flavor or flavor in running.get("skipped_flavors", [])
+    if running.get("job_id") and same_machine:
         if running.get("policy_ref") == policy_ref:
             return status()
         # Same machine, another model: swap it there (no queue, no machine
@@ -120,9 +129,31 @@ def start(policy_ref: str, flavor: str = DEFAULT_FLAVOR) -> dict[str, Any]:
     if running.get("job_id"):
         stop()
 
+    job = _run_job(repo, subfolder, flavor)
+    now = time.time()
+    with _lock:
+        _server.clear()
+        _server.update(
+            job_id=job.id,
+            job_url=job.url,
+            policy_ref=policy_ref,
+            flavor=flavor,
+            started_at=now,
+            flavor_started_at=now,
+            skipped_flavors=[],
+            url=None,
+            running_at=None,
+            reachable_at=None,
+            swap_sent=True,  # the first model is loaded from the job's settings
+        )
+    logger.info("Cloud GPU requested: job %s (%s) for %s", job.id, flavor, policy_ref)
+    return status()
+
+
+def _run_job(repo: str, subfolder: str, flavor: str):
     api, token = _hf()
     code = (Path(__file__).parent / "remote_policy_server.py").read_text(encoding="utf-8")
-    job = api.run_job(
+    return api.run_job(
         image=IMAGE,
         command=["python", "-u", "-c", code],
         env={"MODEL_REPO": repo, "MODEL_SUBFOLDER": subfolder, "IDLE_S": str(IDLE_S), "PORT": str(PORT)},
@@ -132,21 +163,34 @@ def start(policy_ref: str, flavor: str = DEFAULT_FLAVOR) -> dict[str, Any]:
         timeout=JOB_TIMEOUT,
         labels={"lelab": "remote-policy"},
     )
+
+
+def _fall_back(server: dict[str, Any]) -> None:
+    """Cancel a request still waiting for a GPU and ask for the next kind."""
+    next_flavor = FALLBACK_FLAVOR[server["flavor"]]
+    api, _ = _hf()
+    # If this fails, keep the old request rather than risk two machines.
+    api.cancel_job(job_id=server["job_id"])
+    repo, subfolder = _model_location(server["policy_ref"])
+    job = _run_job(repo, subfolder, next_flavor)
     with _lock:
-        _server.clear()
-        _server.update(
-            job_id=job.id,
-            job_url=job.url,
-            policy_ref=policy_ref,
-            flavor=flavor,
-            started_at=time.time(),
-            url=None,
-            running_at=None,
-            reachable_at=None,
-            swap_sent=True,  # the first model is loaded from the job's settings
-        )
-    logger.info("Cloud GPU requested: job %s (%s) for %s", job.id, flavor, policy_ref)
-    return status()
+        turned_off = _server.get("job_id") != server["job_id"]
+        if not turned_off:
+            _server.update(
+                job_id=job.id,
+                job_url=job.url,
+                flavor=next_flavor,
+                flavor_started_at=time.time(),
+                skipped_flavors=[*_server.get("skipped_flavors", []), server["flavor"]],
+            )
+    if turned_off:
+        # Turned off while switching: drop the new request too.
+        api.cancel_job(job_id=job.id)
+        return
+    logger.info(
+        "Cloud GPU: no %s free after %d s, asked for %s instead (job %s)",
+        server["flavor"], QUEUE_FALLBACK_S, next_flavor, job.id,
+    )
 
 
 def stop() -> dict[str, Any]:
@@ -186,11 +230,16 @@ def _steps(server: dict, stage: str, health: dict | None, now: float) -> list[di
     out = []
     if not swapped:
         running_at, reachable_at = server.get("running_at"), server.get("reachable_at")
+        queue_label = "Wait for a free GPU on Hugging Face"
+        skipped = server.get("skipped_flavors") or []
+        if skipped:
+            names = " or ".join(GPU_NAMES.get(f, f) for f in skipped)
+            queue_label = f"No {names} GPU was free, so waiting for an {GPU_NAMES.get(server['flavor'], server['flavor'])} instead"
         if stage != "RUNNING":
-            out.append(step("queue", "Wait for a free GPU on Hugging Face", "active",
+            out.append(step("queue", queue_label, "active",
                             now - server["started_at"], machine_last.get("queue")))
         else:
-            out.append(step("queue", "Wait for a free GPU on Hugging Face", "done",
+            out.append(step("queue", queue_label, "done",
                             (running_at or now) - server["started_at"]))
         if stage != "RUNNING":
             out.append(step("machine", "Start the cloud machine", "pending"))
@@ -254,6 +303,30 @@ def status() -> dict[str, Any]:
         return {**base, "state": "starting", "message": f"Could not reach Hugging Face: {exc}", "steps": []}
 
     stage = info.status.stage
+    if (
+        stage == "SCHEDULING"
+        and server["flavor"] in FALLBACK_FLAVOR
+        and now - server.get("flavor_started_at", server["started_at"]) > QUEUE_FALLBACK_S
+    ):
+        # Only one status poll switches (the app polls from several places).
+        with _lock:
+            claimed = _server.get("job_id") == server["job_id"] and not _server.get("falling_back")
+            if claimed:
+                _server["falling_back"] = True
+        if claimed:
+            try:
+                _fall_back(server)
+                return status()
+            except Exception as exc:
+                logger.warning("Cloud GPU: could not ask for another GPU kind: %s", exc)
+                # Keep waiting on this one; try again after another wait.
+                with _lock:
+                    if _server.get("job_id") == server["job_id"]:
+                        _server["flavor_started_at"] = now
+            finally:
+                with _lock:
+                    _server.pop("falling_back", None)
+
     if stage in ("ERROR", "COMPLETED", "CANCELED", "DELETED"):
         with _lock:
             if _server.get("job_id") == server["job_id"]:
@@ -269,7 +342,8 @@ def status() -> dict[str, Any]:
         with _lock:
             if _server.get("job_id") == server["job_id"] and _server.get("running_at") is None:
                 _server["running_at"] = now
-                _save_timing(f"machine:{server['flavor']}", "queue", now - server["started_at"])
+                _save_timing(f"machine:{server['flavor']}", "queue",
+                             now - server.get("flavor_started_at", server["started_at"]))
             server = dict(_server)
         if url:
             health = _call(url, token, "/health")

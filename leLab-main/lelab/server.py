@@ -66,6 +66,7 @@ from .record import (
 from .rollout import (
     InferenceRequest,
     handle_inference_status,
+    handle_set_inference_task,
     handle_start_inference,
     handle_stop_inference,
 )
@@ -399,6 +400,84 @@ def start_inference(request: InferenceRequest):
             status_code=result.get("status_code", 500),
             detail=result.get("message", "Failed to start inference"),
         )
+    return result
+
+
+class CubeColorSampleRequest(BaseModel):
+    camera_index: int
+    # Where the cube or basket was clicked, as fractions of the picture's
+    # width/height.
+    x: float
+    y: float
+
+
+@app.post("/cube-color-sample")
+def cube_color_sample(request: CubeColorSampleRequest):
+    """Read a cube's or basket's colour (and the table's around it), size and
+    outline where it was clicked in a camera preview, to teach the camera."""
+    from . import camera_preview
+    from .cube_colors import sample
+
+    frame = camera_preview.latest_frame(request.camera_index)
+    if frame is None:
+        raise HTTPException(status_code=409, detail="That camera has no picture yet. Wait for its preview to show.")
+    try:
+        return {"success": True, **sample(frame, request.x, request.y)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class CubeFindRequest(BaseModel):
+    camera_index: int
+    # The taught colours and spots (cube_colors.CubeWatcher's config).
+    config: dict
+
+
+@app.post("/cube-find")
+def cube_find(request: CubeFindRequest):
+    """Find the cubes in a camera preview's newest picture, so the app can
+    box them while the student sets up."""
+    import cv2
+
+    from . import camera_preview
+    from .cube_colors import CubeWatcher
+
+    frame = camera_preview.latest_frame(request.camera_index)
+    if frame is None:
+        raise HTTPException(status_code=409, detail="That camera has no picture yet.")
+    try:
+        watcher = CubeWatcher(request.config, "")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Teach the colors again ({exc}).") from exc
+    watcher.look(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    h, w = frame.shape[:2]
+    return {"success": True, **watcher.view(h / w)}
+
+
+@app.get("/inference-camera-picture")
+def inference_camera_picture():
+    """The top camera picture of the running AI (the run holds the camera, so
+    there's no preview), as the cube watcher last saw it."""
+    from fastapi import Response
+
+    from .rollout import inference_camera_picture as picture
+
+    data = picture()
+    if data is None:
+        raise HTTPException(status_code=404, detail="No picture from the AI run.")
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+class InferenceTaskRequest(BaseModel):
+    task: str
+
+
+@app.post("/inference-task")
+def set_inference_task(request: InferenceTaskRequest):
+    """Switch the running AI to another task (e.g. the other cube)."""
+    result = handle_set_inference_task(request.task)
+    if not result.get("success"):
+        raise HTTPException(status_code=result.get("status_code", 400), detail=result.get("message"))
     return result
 
 

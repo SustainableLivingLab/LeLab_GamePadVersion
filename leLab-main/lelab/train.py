@@ -392,11 +392,14 @@ def build_training_command(
     cmd.extend(["--steps", str(request.steps)])
     cmd.extend(["--batch_size", str(request.batch_size)])
     num_workers = request.num_workers
-    if is_cloud_run and num_workers == 4 and job_target.flavor:
+    if is_cloud_run and num_workers == 4 and job_target.flavor and request.policy_type != "pi05":
         # Small models (ACT, SmolVLA) spend most of each cloud step waiting
         # for video frames to be decoded (ACT on an H200: 0.72 s waiting vs
         # 0.17 s on the GPU). lerobot's default of 4 decoding workers leaves
         # most of the cloud machine's CPUs idle, so use them.
+        # Not for pi0.5: its ~2 s steps are all GPU, and the cloud image's
+        # newer loader opens many video decoders per worker at once, so 16
+        # workers ran out of memory on the first batch (2026-11-09).
         num_workers = _cloud_num_workers(job_target.flavor)
     cmd.extend(["--num_workers", str(num_workers)])
     if request.seed is not None:
