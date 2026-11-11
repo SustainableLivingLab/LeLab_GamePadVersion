@@ -40,13 +40,13 @@ for engine in (SyncInferenceEngine, RTCInferenceEngine):
 
 
 class _Watching:
-    """The cube watcher, made on the first observation (the camera names and
-    the starting pose come from it)."""
+    """The cube watcher, made on the first observation (the camera names
+    come from the robot)."""
 
     def __init__(self) -> None:
         self.task = ""
         self.watcher = None
-        self.start: dict | None = None
+        self.made = False
         self.last = 0.0
         self.lock = threading.Lock()
 
@@ -55,15 +55,15 @@ class _Watching:
         if not self.lock.acquire(blocking=False):
             return
         try:
-            if self.start is None:
-                self.start = {k: v for k, v in obs.items() if k.endswith(".pos")}
+            if not self.made:
+                self.made = True
                 cameras = list(getattr(robot._robot, "cameras", {}) or {})
                 self.watcher = cube_colors.make_watcher(self.task, cameras)
             now = time.monotonic()
             if self.watcher is None or now - self.last < WATCH_EVERY_S:
                 return
             self.last = now
-            cube_colors.watch(self.watcher, obs, self.start)
+            cube_colors.watch(self.watcher, obs)
         except Exception as exc:  # noqa: BLE001 - the run works without it
             cube_colors.logger.warning("Cube colours: look failed (%s)", exc)
         finally:

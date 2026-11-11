@@ -69,12 +69,9 @@ FALLBACK_CUBE_AREA = 0.004
 # that are neither cube nor table (a hand, a sleeve) then match nothing.
 COLOR_MARGIN = 0.6
 # Looks in a row that must agree before the task changes (a few per second),
-# so a hand or the claw passing over the table doesn't flip it.
+# so a hand or the claw passing over the table doesn't flip it. A cube the
+# claw holds is hidden under it, so the task doesn't flip mid-pick either.
 STABLE_LOOKS = 3
-# Joint distance (degrees) from the run's starting pose that still counts as
-# resting. The task only changes while the arm rests, never mid-pick, when
-# the claw over the table (or a lifted cube) would look like a change.
-REST_TOLERANCE_DEG = 15.0
 # Weight of lightness against hue (Lab's L against a, b) when comparing
 # colours: lighting mostly changes how light a colour looks, so a white cube
 # in a dim room should still be nearer white than orange.
@@ -177,6 +174,8 @@ class CubeWatcher:
         self.found: list[dict[str, Any]] = []
         self.task = current_task
         self._streak: tuple[str | None, int] = (None, 0)
+        # False until the camera has first seen a cube.
+        self._decided = False
 
     def search_radius(self, aspect: float) -> float:
         """Search circle radius as a share of the picture's width (aspect =
@@ -238,16 +237,22 @@ class CubeWatcher:
     def look(self, frame_rgb: np.ndarray) -> str | None:
         """Name of the cube to do now (nearest the middle spot), or None."""
         self.found = self.find(frame_rgb)
-        return self.found[0]["name"] if self.found else None
+        self.seen = self.found[0]["name"] if self.found else None
+        return self.seen
 
-    def update(self, frame_rgb: np.ndarray, at_rest: bool) -> str | None:
+    def update(self, frame_rgb: np.ndarray) -> str | None:
         """Look again; returns the new task when it should change, else None."""
         seen = self.look(frame_rgb)
-        self.seen = seen
         name, count = self._streak
+        if seen != name:
+            logger.info("Camera: %s", f"sees the {seen} cube" if seen else "no cube between the baskets")
         self._streak = (seen, count + 1 if seen == name else 1)
-        if seen is None or not at_rest or self._streak[1] < STABLE_LOOKS:
+        # The very first look counts on its own: waiting for more looks lets
+        # the arm head off for the wrong cube.
+        needed = 1 if not self._decided else STABLE_LOOKS
+        if seen is None or self._streak[1] < needed:
             return None
+        self._decided = True
         task = next(c.get("task") for c in self.cubes if c["name"] == seen)
         if not task or task == self.task:
             return None
@@ -262,16 +267,6 @@ class CubeWatcher:
             "cubes": self.found,
             "search": {"x": self.x, "y": self.y, "r": round(self.search_radius(aspect), 4)},
         }
-
-
-def at_rest(state: dict[str, float], start: dict[str, float]) -> bool:
-    """True while every joint but the claw is near where the run started."""
-    for name, value in start.items():
-        if "gripper" in name:
-            continue
-        if name in state and abs(float(state[name]) - float(value)) > REST_TOLERANCE_DEG:
-            return False
-    return True
 
 
 def make_watcher(task: str, camera_keys: list[str]) -> CubeWatcher | None:
@@ -294,7 +289,7 @@ def make_watcher(task: str, camera_keys: list[str]) -> CubeWatcher | None:
         return None
 
 
-def watch(watcher: CubeWatcher, obs: dict, start: dict) -> None:
+def watch(watcher: CubeWatcher, obs: dict) -> None:
     """Look at the run's newest observation: switch the task if the camera
     says so, and report what it saw (and its picture) to LeLab."""
     frame = obs[watcher.camera]
@@ -306,7 +301,7 @@ def watch(watcher: CubeWatcher, obs: dict, start: dict) -> None:
             watcher.task = task_file.read_text(encoding="utf-8").strip() or watcher.task
     except OSError:
         pass
-    task = watcher.update(frame, at_rest(obs, start))
+    task = watcher.update(frame)
     if task and task_file is not None:
         live_task.write(task_file, task)
     seen_path = os.environ.get(CUBE_SEEN_ENV)

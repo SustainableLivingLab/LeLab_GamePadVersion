@@ -93,7 +93,11 @@ class PlanClient:
         return self._thread is not None and self._thread.is_alive()
 
     def request(self, images: dict[str, np.ndarray], state: list[float], step: int) -> None:
-        payload = {"images": {k: _jpeg(v) for k, v in images.items()}, "state": state, "task": self._task.get()}
+        payload = {
+            "images": {k: _jpeg(v) for k, v in images.items()},
+            "state": state,
+            "task": self._task.get(),
+        }
         self.result = None
         self.error = None
 
@@ -102,9 +106,11 @@ class PlanClient:
             try:
                 reply = self._http.post("/act", json=payload)
                 if reply.status_code != 200:
-                    detail = reply.json().get("error") if reply.headers.get("content-type", "").startswith(
-                        "application/json"
-                    ) else reply.text[:200]
+                    detail = (
+                        reply.json().get("error")
+                        if reply.headers.get("content-type", "").startswith("application/json")
+                        else reply.text[:200]
+                    )
                     raise RuntimeError(f"server answered {reply.status_code}: {detail}")
                 data = reply.json()
                 self.round_trips.append(time.perf_counter() - started)
@@ -120,7 +126,9 @@ class PlanClient:
 
 
 def _jpeg(rgb: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    ok, buf = cv2.imencode(
+        ".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    )
     if not ok:
         raise RuntimeError("could not compress a camera image")
     return base64.b64encode(buf.tobytes()).decode()
@@ -211,7 +219,7 @@ def main() -> None:
                     raise RuntimeError(f"The cloud GPU stopped answering: {error}")
 
             if watcher is not None and step % WATCH_EVERY == 0:
-                cube_colors.watch(watcher, obs, initial)
+                cube_colors.watch(watcher, obs)
 
             if len(queue) <= REPLAN_AT and not client.busy and client.result is None:
                 client.request({k: obs[k] for k in camera_keys}, [float(obs[n]) for n in names], step)
